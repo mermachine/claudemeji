@@ -91,45 +91,35 @@ class Config:
         return "sit_idle"
 
 
-def _parse_variant(vdef: dict) -> ActionDef:
-    """Parse a variant (posture/context/previous) sub-definition."""
-    return ActionDef(
-        frames=vdef.get("frames"),
-        files=vdef.get("files"),
-        fps=vdef.get("fps", 8),
-        loop=vdef.get("loop", True),
-        flip=vdef.get("flip", False),
-        intro_files=vdef.get("intro_files"),
-        outro_files=vdef.get("outro_files"),
+def _base_fields(d: dict) -> dict:
+    """Extract the ActionDef fields shared by both full actions and sub-variants."""
+    return dict(
+        frames=d.get("frames"),
+        files=d.get("files"),
+        fps=d.get("fps", 8),
+        loop=d.get("loop", True),
+        flip=d.get("flip", False),
+        intro_files=d.get("intro_files"),
+        outro_files=d.get("outro_files"),
+        walk_speed=d.get("walk_speed", 0.0),
     )
+
+
+def _parse_sub_dict(section: dict) -> dict[str, ActionDef]:
+    """Parse a dict of name → sub-definition (postures, contexts, previous, variants)."""
+    return {name: ActionDef(**_base_fields(d)) for name, d in section.items()}
 
 
 def _parse_action_def(adef: dict) -> ActionDef:
     """Parse a single action definition dict into an ActionDef, including variants."""
-    postures = {}
-    for posture_name, pdef in adef.get("postures", {}).items():
-        postures[posture_name] = _parse_variant(pdef)
-
-    contexts = {}
-    for ctx_name, cdef in adef.get("contexts", {}).items():
-        contexts[ctx_name] = _parse_variant(cdef)
-
-    previous = {}
-    for prev_name, prev_def in adef.get("previous", {}).items():
-        previous[prev_name] = _parse_variant(prev_def)
-
     return ActionDef(
-        frames=adef.get("frames"),
-        files=adef.get("files"),
-        fps=adef.get("fps", 8),
-        loop=adef.get("loop", True),
-        flip=adef.get("flip", False),
-        postures=postures,
-        contexts=contexts,
-        previous=previous,
-        intro_files=adef.get("intro_files"),
-        outro_files=adef.get("outro_files"),
+        **_base_fields(adef),
+        postures=_parse_sub_dict(adef.get("postures", {})),
+        contexts=_parse_sub_dict(adef.get("contexts", {})),
+        previous=_parse_sub_dict(adef.get("previous", {})),
+        variants=list(_parse_sub_dict(adef.get("variants", {})).values()),
         min_restlessness=adef.get("min_restlessness", 0),
+        idle_tier=adef.get("idle_tier", False),
     )
 
 

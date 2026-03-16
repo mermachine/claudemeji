@@ -56,6 +56,7 @@ class ActionDef:
       previous  - previous action name (for transition-specific variants)
       posture   - the physical posture at the time of the event (standing/sitting/etc.)
     Resolution order: context > previous > posture > self
+    After resolution, if the result has variants, one is picked randomly (A/B selection).
     """
 
     def __init__(
@@ -72,6 +73,9 @@ class ActionDef:
         outro_files: list[str] | None = None,
         flip: bool = False,           # legacy compat — ignored at runtime
         min_restlessness: int = 0,    # for idle tiers: minimum restlessness to be eligible
+        walk_speed: float = 0.0,      # nonzero = sprite moves while animating (px/tick)
+        idle_tier: bool = False,      # if true, eligible for idle pool selection
+        variants: list[ActionDef] | None = None,  # A/B variant alternatives
     ):
         self.frames = frames or []
         self.files = files or []
@@ -84,20 +88,29 @@ class ActionDef:
         self.intro_files = intro_files or []   # plays once before main loop
         self.outro_files = outro_files or []   # plays once after loop ends
         self.min_restlessness = min_restlessness
+        self.walk_speed = walk_speed     # 0 = stationary, >0 = moves while playing
+        self.idle_tier = idle_tier       # joins the idle pool when eligible
+        self.variants = variants or []   # alternate animations picked randomly
 
     def frame_count(self) -> int:
         return len(self.files) if self.files else len(self.frames)
 
     def resolve(self, posture: str = "standing", context: str | None = None,
                 previous: str | None = None) -> ActionDef:
-        """Return the best ActionDef for the given state. Order: context > previous > posture > self."""
+        """Return the best ActionDef for the given state.
+        Order: context > previous > posture > self, then A/B variant selection."""
         if context and context in self.contexts:
-            return self.contexts[context]
-        if previous and previous in self.previous:
-            return self.previous[previous]
-        if posture in self.postures:
-            return self.postures[posture]
-        return self
+            result = self.contexts[context]
+        elif previous and previous in self.previous:
+            result = self.previous[previous]
+        elif posture in self.postures:
+            result = self.postures[posture]
+        else:
+            result = self
+        # A/B variant: randomly pick from [result] + result.variants
+        if result.variants:
+            return random.choice([result] + result.variants)
+        return result
 
 
 class SpritePlayer(QWidget):
@@ -216,6 +229,9 @@ class SpritePlayer(QWidget):
 
     def current_action(self) -> str:
         return self._current_action_name
+
+    def current_def(self) -> ActionDef | None:
+        return self._current_def
 
     def previous_action(self) -> str:
         return self._previous_action_name

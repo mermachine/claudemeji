@@ -8,31 +8,195 @@ Animation resolution uses compound state:
 _play(action, force=False) resolves the right ActionDef variant and calls
 player.play(name, posture, context).
 """
+from __future__ import annotations
 
 import sys
 import os
 import argparse
 import random
 import subprocess
+import threading
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt, QTimer
 
-from claudemeji.config import load as load_config
+from claudemeji.config import load as load_config, Config
 from claudemeji.sprite import SpritePlayer
 from claudemeji.physics import PhysicsEngine
 from claudemeji.state import StateMachine
 from claudemeji.watcher import HookWatcher
 from claudemeji.platform_utils import apply_macos_window_fixes
-from claudemeji.windows import get_window_rects, get_window_infos, is_available as windows_available
+from claudemeji.windows import get_window_infos, is_available as windows_available
 from claudemeji.restlessness import RestlessnessEngine
-import claudemeji.windows as _windows_mod
 import claudemeji.window_wrangler as _wrangler
 
-REACTION_LOCK_MS = 4000    # short lock for one-shot reactions (react_good, spawn, etc.)
-TOOL_SAFETY_LOCK_MS = 30000  # fallback in case tool_end never arrives
+REACTION_LOCK_MS = 4000
+TOOL_SAFETY_LOCK_MS = 30000
 UNINTERRUPTABLE = {"fall", "drag", "react_good", "react_bad", "subagent", "spawned",
-                   "jump", "window_throw"}
+                   "jump", "window_throw", "trip"}
+# actions that always hard-cut, never queue behind an outro
+FORCE_ACTIONS = {"drag", "fall", "react_bad"}
 
+
+# --- threaded AX helper ---
+
+def _ax_threaded(fn, *args):
+    """Run an AX API call on a daemon thread (avoids blocking the UI)."""
+    if not _wrangler.is_trusted():
+        return
+    def _safe():
+        try:
+            fn(*args)
+        except Exception as e:
+            print(f"[claudemeji] AX error: {e}")
+    threading.Thread(target=_safe, daemon=True).start()
+
+
+# --- idle / drag resolution ---
+
+def _resolve_idle(config: Config | None, restlessness: int) -> str:
+    """Pick an idle action from the pool based on restlessness level."""
+    if not config:
+        return "sit_idle"
+    pool = ["sit_idle", "stand"]
+    for name, adef in config.actions.items():
+        is_numbered_idle = name.startswith("idle") and name[4:].isdigit()
+        if (is_numbered_idle or adef.idle_tier) and adef.min_restlessness <= restlessness:
+            pool.append(name)
+    return random.choice(pool)
+
+
+def _resolve_drag_context(config: Config | None, restlessness: int,
+                          intensity: str = "calm") -> str | None:
+    """Pick drag context: try r{level}_{intensity}, fall back to r{level}, then base.
+    Two axes: restlessness picks the anger tier, intensity picks the dangle variant."""
+    if not config:
+        return None
+    base = config.actions.get("drag")
+    if not base:
+        return None
+    # try most specific first, then fall back
+    for lvl in range(restlessness, -1, -1):
+        if intensity != "calm":
+            key = f"r{lvl}_{intensity}"
+            if key in base.contexts:
+                return key
+        key = f"r{lvl}"
+        if key in base.contexts:
+            return key
+    # try bare intensity (no restlessness tier)
+    if intensity != "calm" and intensity in base.contexts:
+        return intensity
+    return None
+
+
+# --- debug panel ---
+
+def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
+                      restless: RestlessnessEngine, play_fn, posture_ref: list):
+    """Pop up the debug/tuning dialog."""
+    from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
+                                 QSlider, QLabel, QPushButton, QComboBox)
+    from PyQt6.QtCore import Qt
+
+    dialog = QDialog()
+    dialog.setWindowTitle("claudemeji debug")
+    dialog.setFixedWidth(320)
+    layout = QVBoxLayout()
+    layout.setSpacing(8)
+
+    # current state display
+    action_label = QLabel(f"Action: {player.current_action()}  |  Posture: {posture_ref[0]}")
+    action_label.setStyleSheet("font-weight: bold;")
+    layout.addWidget(action_label)
+    refresh = QTimer()
+    refresh.setInterval(250)
+    refresh.timeout.connect(
+        lambda: action_label.setText(
+            f"Action: {player.current_action()}  |  Posture: {posture_ref[0]}"
+            f"  |  Facing: {physics._facing}"
+        )
+    )
+    refresh.start()
+
+    # pause / resume
+    paused = [False]
+    pause_btn = QPushButton("⏸ Pause physics")
+    def toggle_pause():
+        if paused[0]:
+            physics.start()
+            pause_btn.setText("⏸ Pause physics")
+        else:
+            physics.stop()
+            pause_btn.setText("▶ Resume physics")
+        paused[0] = not paused[0]
+    pause_btn.clicked.connect(toggle_pause)
+    layout.addWidget(pause_btn)
+
+    # animation picker
+    layout.addWidget(QLabel("Play animation:"))
+    anim_row = QHBoxLayout()
+    combo = QComboBox()
+    actions = sorted(player._actions.keys())
+    combo.addItems(actions)
+    if player.current_action() in actions:
+        combo.setCurrentText(player.current_action())
+    def debug_play():
+        physics.lock_for_event()
+        play_fn(combo.currentText(), force=True)
+        QTimer.singleShot(5000, physics.unlock)
+    play_btn = QPushButton("Play")
+    play_btn.clicked.connect(debug_play)
+    anim_row.addWidget(combo)
+    anim_row.addWidget(play_btn)
+    layout.addLayout(anim_row)
+
+    # restlessness slider
+    layout.addWidget(QLabel(""))
+    rest_label = QLabel(f"Restlessness: {restless.level}")
+    rest_slider = QSlider(Qt.Orientation.Horizontal)
+    rest_slider.setRange(0, 4)
+    rest_slider.setValue(restless.level)
+    rest_slider.valueChanged.connect(lambda v: (rest_label.setText(f"Restlessness: {v}"),
+                                                restless._set_level(v)))
+    restless.level_changed.connect(lambda v: (rest_label.setText(f"Restlessness: {v}"),
+                                              rest_slider.setValue(v)))
+    layout.addWidget(rest_label)
+    layout.addWidget(rest_slider)
+    calm_btn = QPushButton("Force calm (level 0)")
+    calm_btn.clicked.connect(lambda: restless._set_level(0))
+    layout.addWidget(calm_btn)
+
+    # position offset sliders
+    layout.addWidget(QLabel(""))
+    layout.addWidget(QLabel("Position offset (debug):"))
+    for axis, getter, setter_fn in [
+        ("X", lambda: physics._offset.x, lambda v: physics.set_offset(float(v), physics._offset.y)),
+        ("Y", lambda: physics._offset.y, lambda v: physics.set_offset(physics._offset.x, float(v))),
+    ]:
+        row = QHBoxLayout()
+        row.addWidget(QLabel(f"{axis}:"))
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(-200, 200)
+        slider.setValue(int(getter()))
+        val_label = QLabel(str(int(getter())))
+        slider.valueChanged.connect(lambda v, lbl=val_label, fn=setter_fn: (lbl.setText(str(v)), fn(v)))
+        row.addWidget(slider)
+        row.addWidget(val_label)
+        layout.addLayout(row)
+        # stash on dialog so reset can find them
+        setattr(dialog, f"_slider_{axis.lower()}", slider)
+
+    reset_btn = QPushButton("Reset offset")
+    reset_btn.clicked.connect(lambda: (dialog._slider_x.setValue(0), dialog._slider_y.setValue(0),
+                                       physics.set_offset(0, 0)))
+    layout.addWidget(reset_btn)
+
+    dialog.setLayout(layout)
+    dialog.show()
+    dialog.exec()
+
+
+# --- main ---
 
 def main():
     parser = argparse.ArgumentParser(description="claudemeji desktop mascot")
@@ -47,12 +211,11 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    # write pid file so the Stop hook can kill us
+    # pid file for Stop hook
     if args.session:
         pid_dir = os.path.expanduser("~/.claudemeji/pids")
         os.makedirs(pid_dir, exist_ok=True)
-        pid_file = os.path.join(pid_dir, f"{args.session}.pid")
-        with open(pid_file, "w") as f:
+        with open(os.path.join(pid_dir, f"{args.session}.pid"), "w") as f:
             f.write(str(os.getpid()))
 
     config_path = os.environ.get("CLAUDEMEJI_CONFIG", None)
@@ -61,6 +224,8 @@ def main():
     except FileNotFoundError as e:
         print(f"[claudemeji] {e}")
         config = None
+
+    # --- sprite player ---
 
     player = SpritePlayer()
     player.setWindowFlags(
@@ -78,11 +243,8 @@ def main():
             if config.pack.is_file_based:
                 player.set_image_dir(config.pack.img_dir_path)
             else:
-                player.load_sheet(
-                    config.pack.sheet_path,
-                    config.pack.frame_width,
-                    config.pack.frame_height,
-                )
+                player.load_sheet(config.pack.sheet_path, config.pack.frame_width,
+                                  config.pack.frame_height)
             for name, action_def in config.actions.items():
                 player.register_action(name, action_def)
             player.play(args.entry_action)
@@ -94,31 +256,31 @@ def main():
     init_y = args.y if args.y is not None else screen.height() - 148
     player.move(init_x, init_y)
     player.show()
+
+    # macOS window fixes (reapplied periodically — Qt resets them)
     QTimer.singleShot(100, lambda: apply_macos_window_fixes(player))
     _pin_timer = QTimer()
     _pin_timer.setInterval(2000)
     _pin_timer.timeout.connect(lambda: apply_macos_window_fixes(player))
     _pin_timer.start()
 
-    # physics
+    # --- physics ---
+
     physics = PhysicsEngine(window=player)
 
-    # apply physics tuning from config
     if config:
         import claudemeji.physics as _physics_mod
         _physics_mod.WINDOW_PULL_DISTANCE = config.physics.window_pull_distance
-        # set native facing from config (which way sprites are drawn)
         facing = config.physics.default_facing
         player._native_facing = facing
         player.set_facing(facing)
         physics._facing = facing
 
-    # platform refresh - push visible window surfaces to physics every 2s
+    # platform refresh
     def refresh_platforms():
         if windows_available():
             infos = get_window_infos(own_pid=os.getpid())
-            platforms = [(info.rect, info.pid) for info in infos]
-            physics.update_platforms(platforms)
+            physics.update_platforms([(info.rect, info.pid) for info in infos])
         else:
             physics.update_platforms([])
 
@@ -126,64 +288,32 @@ def main():
     _platform_timer.setInterval(2000)
     _platform_timer.timeout.connect(refresh_platforms)
     _platform_timer.start()
-    refresh_platforms()  # initial query
+    refresh_platforms()
 
-    # window pull: sprite weight drags windows down
-    def on_pull_window(pid: int, rect, delta_y: float):
-        if not _wrangler.is_trusted():
-            return
-        import threading
-        def _safe_pull():
-            try:
-                _wrangler.move_window_by(pid, rect, 0, delta_y)
-            except Exception:
-                pass
-        threading.Thread(target=_safe_pull, daemon=True).start()
+    # window interactions (all delegated to threaded AX calls)
+    physics.pull_window.connect(
+        lambda pid, rect, dy: _ax_threaded(_wrangler.move_window_by, pid, rect, 0, dy))
+    physics.push_window_move.connect(
+        lambda pid, rect, dx, dy: _ax_threaded(_wrangler.move_window_by, pid, rect, dx, dy))
 
-    physics.pull_window.connect(on_pull_window)
-
-    # window push: sprite pushes a window while walking
-    def on_push_window_move(pid: int, rect, dx: float, dy: float):
-        if not _wrangler.is_trusted():
-            return
-        import threading
-        def _safe_push():
-            try:
-                _wrangler.move_window_by(pid, rect, dx, dy)
-            except Exception:
-                pass
-        threading.Thread(target=_safe_push, daemon=True).start()
-
-    physics.push_window_move.connect(on_push_window_move)
-
-    # window throw: sprite throws a window (arc + minimize)
-    def on_window_throw(pid: int, rect, direction: str):
-        if not _wrangler.is_trusted():
-            return
-        screen = physics._screen_rect()
+    def on_window_throw(pid, rect, direction):
         print(f"[claudemeji] THROW window (pid={pid}, dir={direction})")
-        import threading
-        def _safe_throw():
-            try:
-                _wrangler.throw_and_minimize(pid, rect, screen, direction)
-            except Exception as e:
-                print(f"[claudemeji] throw error: {e}")
-        threading.Thread(target=_safe_throw, daemon=True).start()
+        _ax_threaded(_wrangler.throw_and_minimize, pid, rect, physics._screen_rect(), direction)
 
     physics.window_throw.connect(on_window_throw)
 
-    # ── restlessness engine ──────────────────────────────────────────────────
+    # --- restlessness ---
+
     restless = RestlessnessEngine()
 
-    def on_restless_level_changed(level: int):
+    def on_restless_level(level):
         physics.set_restlessness(level)
         if level == 0:
             print("[claudemeji] restlessness cleared — miku is calm")
 
-    restless.level_changed.connect(on_restless_level_changed)
+    restless.level_changed.connect(on_restless_level)
 
-    # window wrangling: pick a random window and mess with it
-    def on_wrangle_window(level: int):
+    def on_wrangle_window(level):
         if args.solo:
             return
         try:
@@ -191,31 +321,13 @@ def main():
             if not infos:
                 return
             target = random.choice(infos)
-            screen = physics._screen_rect()
-
-            import threading
-            def _safe_wrangle(fn, *a):
-                try:
-                    fn(*a)
-                except Exception as e:
-                    print(f"[claudemeji] wrangle error: {e}")
-
+            screen_rect = physics._screen_rect()
             if level >= 4:
                 print(f"[claudemeji] FERAL — tossing {target.name!r} window")
-                threading.Thread(
-                    target=_safe_wrangle,
-                    args=(_wrangler.toss_window, target.pid, target.rect, screen),
-                    daemon=True,
-                ).start()
+                _ax_threaded(_wrangler.toss_window, target.pid, target.rect, screen_rect)
             else:
                 print(f"[claudemeji] grabby — wiggling {target.name!r} window")
-                threading.Thread(
-                    target=_safe_wrangle,
-                    args=(_wrangler.wiggle_window, target.pid, target.rect),
-                    daemon=True,
-                ).start()
-
-            # ask for AX permission if we don't have it (first wrangle attempt)
+                _ax_threaded(_wrangler.wiggle_window, target.pid, target.rect)
             if not _wrangler.is_trusted() and _wrangler.is_available():
                 _wrangler.request_trust()
         except Exception as e:
@@ -224,238 +336,82 @@ def main():
     restless.wrangle_window.connect(on_wrangle_window)
     restless.start()
 
-    # right-click → debug panel
-    def show_debug_panel():
-        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
-                                     QSlider, QLabel, QPushButton, QComboBox)
-        from PyQt6.QtCore import Qt
+    # --- animation plumbing ---
 
-        dialog = QDialog()
-        dialog.setWindowTitle("claudemeji debug")
-        dialog.setFixedWidth(320)
-        layout = QVBoxLayout()
-        layout.setSpacing(8)
+    _current_posture = ["standing"]
+    _drag_intensity = ["calm"]  # mutable ref for drag intensity axis
 
-        # --- current action display ---
-        action_label = QLabel(f"Action: {player.current_action()}  |  Posture: {_current_posture[0]}")
-        action_label.setStyleSheet("font-weight: bold;")
-        layout.addWidget(action_label)
-        _action_update_timer = QTimer()
-        _action_update_timer.setInterval(250)
-        _action_update_timer.timeout.connect(
-            lambda: action_label.setText(
-                f"Action: {player.current_action()}  |  Posture: {_current_posture[0]}"
-                f"  |  Facing: {physics._facing}"
-            )
-        )
-        _action_update_timer.start()
+    def _play(action: str, force: bool = False):
+        if action in ("sit_idle", "idle"):
+            action = _resolve_idle(config, restless.level)
+        resolved_name = config.resolve_action(action) if config else action
+        posture = _current_posture[0]
+        context = (_resolve_drag_context(config, restless.level, _drag_intensity[0])
+                   if action == "drag" else None)
+        player.play(resolved_name, posture=posture, context=context,
+                    force=(force or action in FORCE_ACTIONS))
+        resolved_def = player.current_def()
+        physics.set_action_walk_speed(resolved_def.walk_speed if resolved_def else 0.0)
 
-        # --- pause / resume ---
-        _paused = [False]
-        pause_btn = QPushButton("⏸ Pause physics")
-        def toggle_pause():
-            if _paused[0]:
-                physics.start()
-                pause_btn.setText("⏸ Pause physics")
-                _paused[0] = False
-            else:
-                physics.stop()
-                pause_btn.setText("▶ Resume physics")
-                _paused[0] = True
-        pause_btn.clicked.connect(toggle_pause)
-        layout.addWidget(pause_btn)
-
-        # --- animation picker ---
-        layout.addWidget(QLabel("Play animation:"))
-        anim_row = QHBoxLayout()
-        combo = QComboBox()
-        actions = sorted(player._actions.keys())
-        combo.addItems(actions)
-        if player.current_action() in actions:
-            combo.setCurrentText(player.current_action())
-        play_btn = QPushButton("Play")
-        def _debug_play():
-            # lock physics so it doesn't override, then play the action
-            physics.lock_for_event()
-            _play(combo.currentText(), force=True)
-            # auto-unlock after 5s so she resumes normal behavior
-            QTimer.singleShot(5000, physics.unlock)
-        play_btn.clicked.connect(_debug_play)
-        anim_row.addWidget(combo)
-        anim_row.addWidget(play_btn)
-        layout.addLayout(anim_row)
-
-        # --- restlessness controls ---
-        layout.addWidget(QLabel(""))  # spacer
-        rest_label = QLabel(f"Restlessness: {restless.level}")
-        rest_slider = QSlider(Qt.Orientation.Horizontal)
-        rest_slider.setRange(0, 4)
-        rest_slider.setValue(restless.level)
-
-        def on_rest_change(val):
-            rest_label.setText(f"Restlessness: {val}")
-            restless._set_level(val)
-
-        rest_slider.valueChanged.connect(on_rest_change)
-        restless.level_changed.connect(lambda v: (rest_label.setText(f"Restlessness: {v}"),
-                                                   rest_slider.setValue(v)))
-        layout.addWidget(rest_label)
-        layout.addWidget(rest_slider)
-
-        btn_calm = QPushButton("Force calm (level 0)")
-        btn_calm.clicked.connect(lambda: restless._set_level(0))
-        layout.addWidget(btn_calm)
-
-        # --- position offset (debug) ---
-        layout.addWidget(QLabel(""))  # spacer
-        layout.addWidget(QLabel("Position offset (debug):"))
-
-        x_row = QHBoxLayout()
-        x_row.addWidget(QLabel("X:"))
-        x_slider = QSlider(Qt.Orientation.Horizontal)
-        x_slider.setRange(-200, 200)
-        x_slider.setValue(int(physics._offset.x))
-        x_val = QLabel(str(int(physics._offset.x)))
-        def on_x_offset(val):
-            x_val.setText(str(val))
-            physics.set_offset(float(val), physics._offset.y)
-        x_slider.valueChanged.connect(on_x_offset)
-        x_row.addWidget(x_slider)
-        x_row.addWidget(x_val)
-        layout.addLayout(x_row)
-
-        y_row = QHBoxLayout()
-        y_row.addWidget(QLabel("Y:"))
-        y_slider = QSlider(Qt.Orientation.Horizontal)
-        y_slider.setRange(-200, 200)
-        y_slider.setValue(int(physics._offset.y))
-        y_val = QLabel(str(int(physics._offset.y)))
-        def on_y_offset(val):
-            y_val.setText(str(val))
-            physics.set_offset(physics._offset.x, float(val))
-        y_slider.valueChanged.connect(on_y_offset)
-        y_row.addWidget(y_slider)
-        y_row.addWidget(y_val)
-        layout.addLayout(y_row)
-
-        reset_btn = QPushButton("Reset offset")
-        reset_btn.clicked.connect(lambda: (x_slider.setValue(0), y_slider.setValue(0),
-                                           physics.set_offset(0, 0)))
-        layout.addWidget(reset_btn)
-
-        dialog.setLayout(layout)
-        dialog.show()
-        dialog.exec()
-
-    player.add_context_action("Debug panel…", show_debug_panel)
-
-    # current posture - updated via signal
-    _current_posture = ["standing"]   # list so lambda can mutate it
-
-    def on_posture_changed(posture: str):
+    def on_posture_changed(posture):
         _current_posture[0] = posture
-        # refresh current animation variant for new posture
-        current = player.current_action()
-        _play(current)
+        _play(player.current_action())
 
     physics.posture_changed.connect(on_posture_changed)
     physics.facing_changed.connect(player.set_facing)
 
-    # actions that always hard-cut, never queue behind an outro
-    FORCE_ACTIONS = {"drag", "fall", "react_bad"}
-
-    def _resolve_idle() -> str:
-        """Pick an idle action from the pool based on current restlessness."""
-        if not config:
-            return "sit_idle"
-        level = restless.level
-        pool = ["sit_idle", "stand"]  # base options
-        for name, adef in config.actions.items():
-            if name.startswith("idle") and name[4:].isdigit():
-                if adef.min_restlessness <= level:
-                    pool.append(name)
-        return random.choice(pool)
-
-    def _resolve_drag_context():
-        """Pick drag context variant based on restlessness (highest tier that exists)."""
-        if not config:
-            return None
-        base = config.actions.get("drag")
-        if not base:
-            return None
-        for lvl in range(restless.level, -1, -1):
-            key = f"r{lvl}"
-            if key in base.contexts:
-                return key
-        return None
-
-    def _play(action: str, force: bool = False):
-        # idle tier resolution: sit_idle or stand may resolve to idle1-5
-        if action in ("sit_idle", "idle"):
-            action = _resolve_idle()
-
-        if config:
-            resolved_name = config.resolve_action(action)
-        else:
-            resolved_name = action
-        posture = _current_posture[0]
-
-        # drag context: restlessness-based, not activity-based
-        context = _resolve_drag_context() if action == "drag" else None
-
-        player.play(resolved_name, posture=posture, context=context,
-                    force=(force or action in FORCE_ACTIONS))
-
-    # drag - immediate hard cut (also calms restlessness)
+    # drag — intensity changes re-resolve the drag animation mid-drag
     def on_drag_start(pos):
         physics.on_drag_start(pos)
         restless.notify_grabbed()
-        _play("drag")  # force=True via FORCE_ACTIONS
+        _drag_intensity[0] = "calm"
+        _play("drag")
 
-    def on_drag_release(pos):
-        physics.on_drag_release(pos)
-        _play("fall")  # force=True via FORCE_ACTIONS
+    def on_drag_intensity(intensity):
+        _drag_intensity[0] = intensity
+        if player.current_action() == "drag":
+            _play("drag", force=True)
 
     player.drag_started.connect(on_drag_start)
     player.drag_moved.connect(physics.on_drag_move)
-    player.drag_released.connect(on_drag_release)
+    player.drag_released.connect(lambda pos: (physics.on_drag_release(pos), _play("fall")))
+    physics.drag_intensity_changed.connect(on_drag_intensity)
 
-    # one-shot finished: resume from current physics/state
+    # one-shot finished
     def on_one_shot_finished():
         if physics._event_locked:
-            # still locked for a tool — stay on whatever the state machine says
             _play(state_machine.state.action)
-        # else: physics is in control — hold last frame, wander timer handles next action
 
     player.one_shot_finished.connect(on_one_shot_finished)
 
-    # locomotion
-    def on_locomotion(action: str):
-        if action in ("climb", "ceiling", "hang", "hang_ceiling",
-                      "jump", "window_push", "window_peek", "window_throw"):
-            # physics explicitly changed state — always play, always force
+    # locomotion → animation
+    # all locomotion force-cuts: physics state changes are immediate,
+    # animations must match (no sliding while outro plays, no standing while walking)
+    def on_locomotion(action):
+        # these override everything, even event lock
+        always_force = ("climb", "ceiling", "hang", "hang_ceiling",
+                        "jump", "window_push", "window_peek", "window_throw",
+                        "trip", "fall")
+        if action in always_force:
             _play(action, force=True)
         elif action == "land":
-            # landed — play stand or sit_idle as a soft transition (triggers fall outro)
-            # wander timer is already scheduled, so she'll pick her next action naturally
             if not physics._event_locked:
-                _play(random.choice(["stand", "sit_idle"]))
+                _play(random.choice(["stand", "sit_idle"]), force=True)
         elif action == "idle":
-            # deliberate idle behavior — resolve from pool
             if not physics._event_locked:
-                _play(_resolve_idle())
+                _play(_resolve_idle(config, restless.level), force=True)
         elif not physics._event_locked:
-            _play(action)
+            _play(action, force=True)
 
     physics.locomotion_action.connect(on_locomotion)
     physics.start()
 
-    # event lock timer
+    # --- state machine + event lock ---
+
     _event_unlock_timer = QTimer()
     _event_unlock_timer.setSingleShot(True)
     _event_unlock_timer.timeout.connect(physics.unlock)
 
-    # state machine
     state_machine = StateMachine(on_change=lambda state: on_state_change(state))
 
     def on_state_change(state):
@@ -466,10 +422,10 @@ def main():
         print(f"[claudemeji] event → {state.action} (posture: {_current_posture[0]})")
         physics.lock_for_event()
         _play(state.action)
-        # timer NOT managed here - handled by on_event_received / synthetic event handlers
 
-    # sub-miku tracking (spawned for subagents)
-    _sub_mikis: list = []
+    # --- sub-miku tracking ---
+
+    _sub_mikus: list = []
 
     def _spawn_sub_miku():
         pos = player.pos()
@@ -480,72 +436,66 @@ def main():
             [sys.executable, "-m", "claudemeji.main",
              "--scale", "0.5", "--solo",
              "--entry-action", "spawned",
-             "--x", str(pos.x() + (20 if len(_sub_mikis) % 2 == 0 else -20)),
+             "--x", str(pos.x() + (20 if len(_sub_mikus) % 2 == 0 else -20)),
              "--y", str(pos.y())],
             env=env,
         )
-        _sub_mikis.append(proc)
-        # prune finished ones
-        _sub_mikis[:] = [p for p in _sub_mikis if p.poll() is None]
+        _sub_mikus.append(proc)
+        _sub_mikus[:] = [p for p in _sub_mikus if p.poll() is None]
 
     def _dismiss_sub_miku():
-        if _sub_mikis:
-            proc = _sub_mikis.pop()
-            proc.terminate()
+        if _sub_mikus:
+            _sub_mikus.pop().terminate()
+
+    # --- debug panel + context menu ---
+
+    player.add_context_action("Debug panel…",
+                              lambda: _show_debug_panel(player, physics, restless, _play, _current_posture))
+
+    # --- solo mode (no event watching) ---
 
     if args.solo:
-        # solo mode: no event watching, just physics + wandering
-        # if entry action is "spawned", burst outward like emerging from parent
         if args.entry_action == "spawned":
             direction = 1 if (args.x or 0) >= 0 else -1
             QTimer.singleShot(200, lambda: physics.jump_burst(direction))
         sys.exit(app.exec())
 
-    # hook watcher
+    # --- hook watcher ---
+
     watcher = HookWatcher(session_id=args.session)
 
-    def on_event_received(event: dict):
+    def on_event_received(event):
         etype = event.get("event_type", "")
         tool_name = event.get("tool_name", "")
-        restless.notify_event()   # any hook event resets the idle clock + clears restlessness
+        restless.notify_event()
 
         if etype == "tool_end":
-            # cancel safety timer and unlock immediately
             _event_unlock_timer.stop()
             physics.unlock()
 
-        # spawn/dismiss sub-miku for subagent tools
         if etype == "tool_start" and tool_name in ("Agent", "Task"):
             _spawn_sub_miku()
         elif etype == "subagent_stop":
             _dismiss_sub_miku()
 
         state_machine.handle_event(event)
-        # set timer AFTER handle_event so we overwrite any stale timer
+
         if etype == "tool_start":
-            _event_unlock_timer.start(TOOL_SAFETY_LOCK_MS)  # long: tool_end will cancel it
+            _event_unlock_timer.start(TOOL_SAFETY_LOCK_MS)
         elif etype != "tool_end":
-            _event_unlock_timer.start(REACTION_LOCK_MS)  # short: session events, notifications
+            _event_unlock_timer.start(REACTION_LOCK_MS)
 
     watcher.event_received.connect(on_event_received)
-    watcher.idle_triggered.connect(lambda: physics.unlock())  # just unlock, hold frame
+    watcher.idle_triggered.connect(physics.unlock)
 
     def on_wait_triggered():
-        # tool is taking ages or waiting for permission - switch to wait animation
-        # but don't override "run": bash running long is fine, she's clearly working
         if state_machine.state.action == "bash":
             return
-        # inject a synthetic wait event; on_state_change handles lock + play
         state_machine.handle_event({"event_type": "tool_start", "tool_name": "_wait"})
         _event_unlock_timer.start(TOOL_SAFETY_LOCK_MS)
 
-    def on_wait_cleared():
-        # tool finally finished - unlock and let physics resume
-        physics.unlock()
-        _play("stand")
-
     watcher.wait_triggered.connect(on_wait_triggered)
-    watcher.wait_cleared.connect(on_wait_cleared)
+    watcher.wait_cleared.connect(lambda: (physics.unlock(), _play("stand")))
     watcher.start()
 
     sys.exit(app.exec())

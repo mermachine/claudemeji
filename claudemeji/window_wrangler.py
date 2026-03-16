@@ -211,17 +211,8 @@ def wiggle_window(pid: int, rect: QRect, amplitude: int = 12, shakes: int = 4) -
     return True
 
 
-def minimize_window(pid: int, rect: QRect) -> bool:
-    """
-    Minimize a window via the Accessibility API.
-    Used by window throw (the window is 'tossed away' = minimized).
-    Returns True if successful.
-    """
-    if not is_trusted():
-        return False
-    win = _find_ax_window(pid, rect)
-    if win is None:
-        return False
+def _minimize_ax_window(win) -> bool:
+    """Minimize an AX window element. Returns True on success."""
     try:
         from Foundation import NSNumber
         err = AXUIElementSetAttributeValue(win, kAXMinimizedAttribute,
@@ -229,6 +220,17 @@ def minimize_window(pid: int, rect: QRect) -> bool:
         return err == 0
     except Exception:
         return False
+
+
+def minimize_window(pid: int, rect: QRect) -> bool:
+    """
+    Minimize a window via the Accessibility API.
+    Used by window throw (the window is 'tossed away' = minimized).
+    """
+    if not is_trusted():
+        return False
+    win = _find_ax_window(pid, rect)
+    return _minimize_ax_window(win) if win else False
 
 
 def throw_and_minimize(pid: int, rect: QRect, screen_rect: QRect,
@@ -250,28 +252,14 @@ def throw_and_minimize(pid: int, rect: QRect, screen_rect: QRect,
     # arc upward and to the side, with slight rotation feel (wobble x)
     for i in range(steps + 1):
         t = i / steps
-        # parabolic arc: goes up then curves
         t_ease = t * t
-        if direction == "left":
-            nx = ox - 200 * t_ease
-        else:
-            nx = ox + 200 * t_ease
-        # arc up: peaks at t=0.5, then comes back (but we minimize before it lands)
+        nx = ox + (-200 if direction == "left" else 200) * t_ease
         ny = oy - 300 * (4 * t * (1 - t))  # parabola peaking at 300px above
-        # add wobble for "tumbling" feel
-        wobble = 8 * ((-1) ** i) * (1 - t)
-        nx += wobble
+        nx += 8 * ((-1) ** i) * (1 - t)     # wobble for "tumbling" feel
         _ax_set_position(win, nx, ny)
         time.sleep(step_s)
 
-    # minimize at the end
-    try:
-        from Foundation import NSNumber
-        AXUIElementSetAttributeValue(win, kAXMinimizedAttribute,
-                                     NSNumber.numberWithBool_(True))
-    except Exception:
-        pass
-    return True
+    return _minimize_ax_window(win)
 
 
 def toss_window(pid: int, rect: QRect, screen_rect: QRect,

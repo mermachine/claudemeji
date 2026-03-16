@@ -33,65 +33,91 @@ from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import QApplication
 
 
+# --- constants ---
+
 TICK_MS = 16
 GRAVITY = 0.6
 MAX_FALL_SPEED = 20
-WALK_SPEED = 2
-RUN_SPEED  = 4          # fast walk at higher restlessness
+WALK_SPEED   = 2
+RUN_SPEED    = 4
+SPRINT_SPEED = 8     # full dash at high restlessness
 IDLE_WANDER_INTERVAL = (180, 420)
-VELOCITY_HISTORY = 5
-SITTING_TIMEOUT = 300   # ticks of stillness before transitioning to SITTING (~5s)
-SURFACE_TOLERANCE = 4.0  # pixels: how close to a surface counts as "on it"
+VELOCITY_HISTORY = 3     # fewer samples = snappier throw response
+SITTING_TIMEOUT = 300
+SURFACE_TOLERANCE = 4.0
 
-# wall climbing / ceiling crawling (base values; restlessness multiplies these)
-WALL_GRAB_CHANCE    = 0.35         # chance to grab a screen wall when falling into it
-CLIMB_SPEED         = 1.5          # px/tick upward while climbing
-CLIMB_DURATION      = (120, 360)   # ticks (~2-6s) on wall before falling or reaching top
-CEILING_CRAWL_SPEED = 1.2          # px/tick horizontal on ceiling
-CEILING_DURATION    = (120, 300)   # ticks (~2-5s) on ceiling before letting go
+# wall climbing / ceiling crawling
+WALL_GRAB_CHANCE    = 0.35
+CLIMB_SPEED         = 1.5
+CLIMB_DURATION      = (120, 360)
+CEILING_CRAWL_SPEED = 1.2
+CEILING_DURATION    = (120, 300)
 
-# hanging: stop climbing, just dangle on wall or ceiling
-HANG_CHANCE         = 0.35         # chance to hang instead of falling when climb expires
-HANG_DURATION       = (180, 420)   # ticks (~3-7s) of hanging before letting go
+# hanging
+HANG_CHANCE         = 0.35
+HANG_DURATION       = (180, 420)
 
-# jumping: impulse-based launch toward a target
-JUMP_IMPULSE_X      = 6.0          # horizontal speed component
-JUMP_IMPULSE_Y      = -12.0        # vertical speed component (upward)
-JUMP_MIN_HEIGHT     = -8.0         # minimum upward component even for horizontal jumps
+# jumping
+JUMP_IMPULSE_X      = 6.0
+JUMP_IMPULSE_Y      = -12.0
+JUMP_MIN_HEIGHT     = -8.0
 
 # cursor following (restlessness-gated)
-CURSOR_FOLLOW_CHANCE = {2: 0.15, 3: 0.30, 4: 0.45}  # per wander decision
-CURSOR_JUMP_DISTANCE = 250         # jump toward cursor if within this many px
-CURSOR_JUMP_CHANCE   = 0.35        # chance to jump vs walk when following cursor
+CURSOR_FOLLOW_CHANCE = {2: 0.15, 3: 0.30, 4: 0.45}
+CURSOR_JUMP_DISTANCE = 250
+CURSOR_JUMP_CHANCE   = 0.35
 
 # window pushing/dragging
-WINDOW_PUSH_SPEED     = 1.0        # px/tick while pushing a window
-WINDOW_PUSH_DURATION  = (180, 600) # ticks (~3-10s) of pushing before releasing
-WINDOW_PUSH_EMIT_INTERVAL = 3      # emit push signal every N ticks
+WINDOW_PUSH_SPEED     = 1.0
+WINDOW_PUSH_DURATION  = (180, 600)
+WINDOW_PUSH_EMIT_INTERVAL = 3
 
 # window peeking
-WINDOW_PEEK_DURATION  = (120, 300) # ticks (~2-5s) of peeking
+WINDOW_PEEK_DURATION  = (120, 300)
 
 # window throwing
-WINDOW_THROW_ARC_STEPS = 15        # animation steps for throw arc
+WINDOW_THROW_ARC_STEPS = 15
 
-# side-climbing window pull (climbing on a window's side pulls it down)
-SIDE_PULL_SPEED       = 0.3        # px/tick downward pull while climbing a window side
-SIDE_PULL_INTERVAL    = 8          # emit pull every N ticks while side-climbing
+# trip/stumble (rare event during run, gated by restlessness)
+TRIP_CHANCE = {2: 0.03, 3: 0.06, 4: 0.10}  # per wander decision while running
 
-# restlessness modifiers per level
-# each entry is (wander_interval_multiplier, wall_grab_chance, climb_duration_multiplier)
+# edge leap (deliberate jump off platform edge instead of just falling)
+EDGE_LEAP_CHANCE     = 0.40   # chance to leap instead of fall when walking off edge
+EDGE_LEAP_IMPULSE_X  = 5.0   # horizontal impulse for edge leap
+EDGE_LEAP_IMPULSE_Y  = -8.0  # upward impulse for edge leap
+
+# drag intensity (how far sprite dangles from grab point)
+DRAG_CALM_DISTANCE   = 30    # within this many px of grab point = calm
+DRAG_MILD_DISTANCE   = 80    # 30-80px = mild dangle; beyond 80 = strong
+DRAG_INTENSITY_LEVELS = ("calm", "mild", "strong")
+
+# throw-to-wall (high velocity release → guaranteed wall cling)
+THROW_VELOCITY_THRESHOLD = 6.0    # velocity magnitude to count as "thrown"
+THROWN_WALL_GRAB_CHANCE  = 0.90   # near-guaranteed wall grab when thrown into a wall
+THROW_VELOCITY_SCALE     = 3.5   # amplify release velocity for satisfying throws
+
+# side-climbing window pull
+SIDE_PULL_SPEED       = 0.3
+SIDE_PULL_INTERVAL    = 8
+
+# window pull (sprite weight on windows)
+WINDOW_PULL_DISTANCE = 0   # override via [physics] window_pull_distance in config.toml
+WINDOW_PULL_SPEED    = 0.5
+WINDOW_PULL_INTERVAL = 5
+
+# restlessness modifiers: (wander_interval_mul, wall_grab_chance, climb_duration_mul)
 _RESTLESS_PARAMS = {
     0: (1.0,  0.00, 1.0),   # calm: no climbing
-    1: (0.6,  0.25, 1.0),   # fidgety: shorter wander pauses, sometimes climbs
-    2: (0.4,  0.35, 1.2),   # climby: more climbing, but balanced with other behaviors
+    1: (0.6,  0.25, 1.0),   # fidgety: shorter pauses, sometimes climbs
+    2: (0.4,  0.35, 1.2),   # climby: more climbing, window interactions
     3: (0.35, 0.45, 1.4),   # grabby: frequent climbing, window interactions
     4: (0.25, 0.50, 1.6),   # feral: lots of everything
 }
 
-# chance to seek a window to interact with (walk toward it) per wander decision
 WINDOW_SEEK_CHANCE = {2: 0.15, 3: 0.25, 4: 0.35}
 
+
+# --- enums ---
 
 class PhysicsState(Enum):
     GROUNDED       = auto()
@@ -100,8 +126,8 @@ class PhysicsState(Enum):
     WALL_RIGHT     = auto()
     CEILING        = auto()
     DRAGGED        = auto()
-    PUSHING_WINDOW = auto()  # walking while dragging/pushing a window
-    PEEKING        = auto()  # peeking from a window corner
+    PUSHING_WINDOW = auto()
+    PEEKING        = auto()
 
 
 class PostureState(Enum):
@@ -112,10 +138,12 @@ class PostureState(Enum):
     CLIMBING = "climbing"
     CEILING  = "ceiling"
     DRAGGED  = "dragged"
-    HANGING  = "hanging"   # dangling on wall or ceiling without climbing
-    PUSHING  = "pushing"   # pushing/dragging a window
-    PEEKING  = "peeking"   # peeking from a window corner
+    HANGING  = "hanging"
+    PUSHING  = "pushing"
+    PEEKING  = "peeking"
 
+
+# --- small state bundles ---
 
 @dataclass
 class Vec2:
@@ -123,19 +151,105 @@ class Vec2:
     y: float = 0.0
 
 
-WINDOW_PULL_DISTANCE = 0   # how far sprite weight pulls windows down (0 = disabled)
-                           # override via [physics] window_pull_distance in config.toml
-WINDOW_PULL_SPEED    = 0.5 # px/tick downward pull rate
-WINDOW_PULL_INTERVAL = 5   # only emit pull signal every N ticks (avoid thrashing AX API)
+@dataclass
+class ClimbState:
+    ticks: int = 0
+    pin_x: float = 0.0       # x position pinned to while climbing
+    ceiling_dir: int = 1     # horizontal crawl direction on ceiling
+    hanging: bool = False
+    window: tuple | None = None   # (QRect, pid) when climbing a window side
+    side_pull_counter: int = 0
 
+
+@dataclass
+class PushState:
+    window: tuple | None = None   # (QRect, pid)
+    corner: str = "left"
+    ticks: int = 0
+    direction: int = 1
+
+
+@dataclass
+class PullState:
+    """Tracks weight-pulling on the window we're standing on."""
+    standing_on: tuple | None = None   # (QRect, pid) or None
+    applied: float = 0.0
+    tick_counter: int = 0
+
+    def reset(self):
+        self.standing_on = None
+        self.applied = 0.0
+        self.tick_counter = 0
+
+
+# --- helpers ---
+
+def _restless_params(level: int) -> tuple:
+    return _RESTLESS_PARAMS.get(level, _RESTLESS_PARAMS[0])
+
+
+def _weighted_choice(options: list[tuple[str, float]]) -> str:
+    """Pick from [(name, weight), ...] using weighted random selection."""
+    total = sum(w for _, w in options)
+    roll = random.random() * total
+    cumulative = 0.0
+    for name, weight in options:
+        cumulative += weight
+        if roll < cumulative:
+            return name
+    return options[-1][0]  # fallback
+
+
+# --- platform helpers (work on normalized (QRect, pid) lists) ---
+
+def _find_surface_below(platforms, x: float, y_from: float, miku_w: float,
+                        miku_h: float, screen_floor: float) -> float:
+    """Highest surface at x that is at or below y_from."""
+    best = screen_floor
+    for rect, _pid in platforms:
+        if x + miku_w > rect.left() and x < rect.right():
+            surface = float(rect.top()) - miku_h
+            if surface >= y_from and surface < best:
+                best = surface
+    return best
+
+
+def _surface_at(platforms, x: float, floor_y: float, miku_w: float,
+                miku_h: float, screen_floor: float) -> bool:
+    """Is there a walkable surface at (x, floor_y)?"""
+    if abs(floor_y - screen_floor) < SURFACE_TOLERANCE:
+        return True
+    for rect, _pid in platforms:
+        if x + miku_w > rect.left() and x < rect.right():
+            surface = float(rect.top()) - miku_h
+            if abs(surface - floor_y) < SURFACE_TOLERANCE:
+                return True
+    return False
+
+
+def _find_platform_at(platforms, x: float, floor_y: float, miku_w: float,
+                      miku_h: float, screen_floor: float):
+    """Which platform is at floor_y? Returns (QRect, pid) or None."""
+    if abs(floor_y - screen_floor) < SURFACE_TOLERANCE:
+        return None
+    for rect, pid in platforms:
+        if x + miku_w > rect.left() and x < rect.right():
+            surface = float(rect.top()) - miku_h
+            if abs(surface - floor_y) < SURFACE_TOLERANCE:
+                return (rect, pid)
+    return None
+
+
+# --- engine ---
 
 class PhysicsEngine(QObject):
-    locomotion_action = pyqtSignal(str)
-    posture_changed   = pyqtSignal(str)    # PostureState.value
-    facing_changed    = pyqtSignal(str)    # "left" or "right"
-    pull_window       = pyqtSignal(int, object, float)  # (pid, QRect, delta_y)
-    push_window_move  = pyqtSignal(int, object, float, float)  # (pid, QRect, dx, dy)
-    window_throw      = pyqtSignal(int, object, str)    # (pid, QRect, direction)
+    locomotion_action      = pyqtSignal(str)
+    posture_changed        = pyqtSignal(str)
+    facing_changed         = pyqtSignal(str)
+    pull_window            = pyqtSignal(int, object, float)
+    push_window_move       = pyqtSignal(int, object, float, float)
+    window_throw           = pyqtSignal(int, object, str)
+    drag_intensity_changed = pyqtSignal(str)  # "calm", "mild", "strong"
 
     def __init__(self, window, parent=None):
         super().__init__(parent)
@@ -145,50 +259,38 @@ class PhysicsEngine(QObject):
         self._posture = PostureState.FALLING
         self._walk_dir = 0
         self._wander_ticks = 0
-        self._still_ticks = 0        # counts up while grounded+still
+        self._still_ticks = 0
         self._event_locked = False
+        self._running = False
+        self._sprinting = False
+        self._following_cursor = False
+        self._action_walk_speed = 0.0
+        self._facing = "left"
+        self._offset = Vec2()
+        self._floor_y = 0.0
+        self._restlessness = 0
+
+        # drag
         self._dragged = False
         self._drag_offset = QPoint()
         self._cursor_history: list[QPoint] = []
-        self._platforms: list = []   # list of (QRect, pid) tuples for walkable window surfaces
-        self._floor_y: float = 0.0   # y where she's currently standing (set on land)
-        self._climb_ticks: int = 0   # countdown while on wall or ceiling
-        self._climb_x: float = 0.0  # x position to pin to while climbing (screen edge or window side)
-        self._ceiling_dir: int = 1   # horizontal crawl direction on ceiling (-1 left, 1 right)
-        self._running: bool = False  # True when doing fast walk (restless "run" action)
-        self._hanging: bool = False  # True when hanging (not climbing) on wall or ceiling
+        self._drag_intensity: str = "calm"  # current dangle level during drag
+        self._thrown: bool = False           # True after high-velocity release (boosts wall grab)
 
-        # side-climbing window pull: climbing a window side pulls it down
-        self._climbing_window: tuple | None = None  # (QRect, pid) when climbing a window (not screen edge)
-        self._side_pull_counter: int = 0
+        # grouped state
+        self._climb = ClimbState()
+        self._push = PushState()
+        self._pull = PullState()
+        self._peek_ticks = 0
 
-        # window pulling: sprite weight pulls windows down
-        self._standing_on_window: tuple | None = None  # (QRect, pid) or None
-        self._window_pull_applied: float = 0.0
-        self._pull_tick_counter: int = 0
-
-        # window pushing/dragging state
-        self._push_window_info: tuple | None = None  # (QRect, pid)
-        self._push_corner: str = "left"              # which corner sprite is on ("left" or "right")
-        self._push_ticks: int = 0
-        self._push_dir: int = 1                      # walking direction while pushing
-
-        # window peeking state
-        self._peek_ticks: int = 0
-        self._peek_corner: str = "left"
-
-        # cursor following
-        self._following_cursor: bool = False
-
-        # position offset (debug)
-        self._offset = Vec2()  # added to final position each tick
-
-        self._restlessness = 0  # 0–4, set by RestlessnessEngine via set_restlessness()
-        self._facing = "left"   # current facing direction (default matches most sprite packs)
+        # platforms: normalized to list of (QRect, pid)
+        self._platforms: list[tuple[QRect, int]] = []
 
         self._timer = QTimer(self)
         self._timer.setInterval(TICK_MS)
         self._timer.timeout.connect(self._tick)
+
+    # --- start / stop ---
 
     def start(self):
         self._timer.start()
@@ -200,34 +302,30 @@ class PhysicsEngine(QObject):
     def current_posture(self) -> str:
         return self._posture.value
 
+    # --- restlessness ---
+
     def set_restlessness(self, level: int):
-        """Called by RestlessnessEngine when level changes (0–4)."""
         self._restlessness = max(0, min(4, level))
-        # if she's sitting still and we get restless, nudge her into motion
         if level >= 1 and self._state == PhysicsState.GROUNDED and self._walk_dir == 0:
-            self._wander_ticks = 1   # trigger a wander decision next tick
+            self._wander_ticks = 1
 
-    def _restless_wall_grab_chance(self) -> float:
-        return _RESTLESS_PARAMS.get(self._restlessness, _RESTLESS_PARAMS[0])[1]
+    def _wall_grab_chance(self) -> float:
+        return _restless_params(self._restlessness)[1]
 
-    def _restless_climb_duration(self) -> tuple[int, int]:
-        mul = _RESTLESS_PARAMS.get(self._restlessness, _RESTLESS_PARAMS[0])[2]
-        lo  = int(CLIMB_DURATION[0] * mul)
-        hi  = int(CLIMB_DURATION[1] * mul)
-        return lo, hi
+    def _climb_duration(self) -> tuple[int, int]:
+        mul = _restless_params(self._restlessness)[2]
+        return int(CLIMB_DURATION[0] * mul), int(CLIMB_DURATION[1] * mul)
 
-    # --- event animation lock ---
+    # --- platforms ---
 
     def update_platforms(self, platforms: list):
-        """Update list of window platforms. Each entry is (QRect, pid) or just QRect."""
-        self._platforms = platforms
+        """Normalize and store platforms as (QRect, pid) tuples."""
+        self._platforms = [
+            (entry[0], entry[1]) if isinstance(entry, tuple) else (entry, 0)
+            for entry in platforms
+        ]
 
-    def force_reland(self):
-        """Drop from current position so she re-lands on updated surfaces."""
-        if self._state == PhysicsState.GROUNDED:
-            self._state = PhysicsState.FALLING
-            self._set_posture(PostureState.FALLING)
-            self.locomotion_action.emit("fall")
+    # --- event animation lock ---
 
     def lock_for_event(self):
         if self._state in (PhysicsState.DRAGGED, PhysicsState.FALLING,
@@ -237,16 +335,101 @@ class PhysicsEngine(QObject):
         self._walk_dir = 0
         self._vel.x = 0
         self._following_cursor = False
+        self._action_walk_speed = 0.0
 
     def unlock(self):
         self._event_locked = False
         self._schedule_wander()
 
+    def force_reland(self):
+        if self._state == PhysicsState.GROUNDED:
+            self._start_falling()
+
+    def set_action_walk_speed(self, speed: float):
+        self._action_walk_speed = speed
+        if speed > 0 and self._state == PhysicsState.GROUNDED and self._walk_dir == 0:
+            self._walk_dir = random.choice([-1, 1])
+            self._set_facing("left" if self._walk_dir < 0 else "right")
+            self._set_posture(PostureState.WALKING)
+
+    def set_offset(self, dx: float, dy: float):
+        self._offset = Vec2(dx, dy)
+
+    # --- common transitions ---
+
+    def _start_falling(self):
+        self._state = PhysicsState.FALLING
+        self._set_posture(PostureState.FALLING)
+        self.locomotion_action.emit("fall")
+
+    def _start_walking(self, direction: int, run: bool = False, sprint: bool = False):
+        self._walk_dir = direction
+        self._still_ticks = 0
+        self._running = run or sprint
+        self._sprinting = sprint
+        self._following_cursor = False
+        self._set_posture(PostureState.WALKING)
+        self._set_facing("left" if direction < 0 else "right")
+        action = "sprint" if sprint else ("run" if run else "walk")
+        self.locomotion_action.emit(action)
+
+    def _return_to_ground(self):
+        """Transition from push/peek back to grounded idle."""
+        self._push.window = None
+        self._state = PhysicsState.GROUNDED
+        self._set_posture(PostureState.STANDING)
+        self._schedule_wander()
+
+    def _start_wall_climb(self, wall: PhysicsState, window_info: tuple | None = None):
+        self._state = wall
+        self._vel = Vec2()
+        self._climb.ticks = random.randint(*self._climb_duration())
+        self._climb.pin_x = float(self._window.pos().x())
+        self._climb.hanging = False
+        self._climb.window = window_info
+        self._climb.side_pull_counter = 0
+        self._set_posture(PostureState.CLIMBING)
+        self._set_facing("left" if wall == PhysicsState.WALL_LEFT else "right")
+        self.locomotion_action.emit("climb")
+
+    def _maybe_hang_or_fall(self, hang_action: str = "hang"):
+        """Climb/ceiling expired — either hang or fall."""
+        if random.random() < HANG_CHANCE:
+            self._climb.hanging = True
+            self._climb.ticks = random.randint(*HANG_DURATION)
+            self._set_posture(PostureState.HANGING)
+            self.locomotion_action.emit(hang_action)
+        else:
+            self._climb.hanging = False
+            self._climb.window = None
+            self._start_falling()
+
+    def _land(self, floor_y: float):
+        self._floor_y = floor_y
+        self._thrown = False
+        self._state = PhysicsState.GROUNDED
+        self._walk_dir = 0
+        self._still_ticks = 0
+        self._running = False
+        self._sprinting = False
+        self._set_posture(PostureState.STANDING)
+        self._schedule_wander()
+        self.locomotion_action.emit("land")
+        # check if we landed on a window (for weight-pulling)
+        miku_w, miku_h = float(self._window.width()), float(self._window.height())
+        x = float(self._window.pos().x())
+        screen_floor = float(self._screen_rect().bottom() - self._window.height())
+        self._pull = PullState(
+            standing_on=_find_platform_at(self._platforms, x, floor_y, miku_w, miku_h, screen_floor)
+        )
+
     # --- drag ---
 
     def on_drag_start(self, cursor_global: QPoint):
         self._dragged = True
-        self._reset_window_pull()
+        self._thrown = False
+        self._drag_intensity = "calm"
+        self._pull.reset()
         self._state = PhysicsState.DRAGGED
         self._vel = Vec2()
         self._drag_offset = cursor_global - self._window.pos()
@@ -262,6 +445,28 @@ class PhysicsEngine(QObject):
             self._cursor_history.pop(0)
         self._window.move(cursor_global - self._drag_offset)
 
+        # track drag intensity: how far is she dangling from the grab point?
+        pos = self._window.pos()
+        sprite_cx = pos.x() + self._window.width() / 2
+        cursor_x = cursor_global.x()
+        offset = abs(cursor_x - sprite_cx)
+
+        if offset < DRAG_CALM_DISTANCE:
+            intensity = "calm"
+        elif offset < DRAG_MILD_DISTANCE:
+            intensity = "mild"
+        else:
+            intensity = "strong"
+
+        if intensity != self._drag_intensity:
+            self._drag_intensity = intensity
+            self.drag_intensity_changed.emit(intensity)
+
+        # update facing based on which side she's dangling from
+        # if sprite center is left of cursor, she's dangling left
+        dangle_dir = "left" if sprite_cx < cursor_x else "right"
+        self._set_facing(dangle_dir)
+
     def on_drag_release(self, cursor_global: QPoint):
         if not self._dragged:
             return
@@ -274,65 +479,63 @@ class PhysicsEngine(QObject):
             dy = cursor_global.y() - self._cursor_history[0].y()
             n = len(self._cursor_history)
             vx, vy = dx / n, dy / n
-            self._vel.x = vx if abs(vx) > 3.0 else 0.0
-            self._vel.y = vy if abs(vy) > 2.0 else 0.0
+            # zero out tiny movements, then amplify for satisfying throws
+            vx = (vx * THROW_VELOCITY_SCALE) if abs(vx) > 2.0 else 0.0
+            vy = (vy * THROW_VELOCITY_SCALE) if abs(vy) > 1.5 else 0.0
+            self._vel = Vec2(vx, vy)
+            speed = (vx ** 2 + vy ** 2) ** 0.5
+            self._thrown = speed >= THROW_VELOCITY_THRESHOLD
         else:
             self._vel = Vec2()
+            self._thrown = False
 
         self.locomotion_action.emit("fall")
 
     # --- jumping ---
 
     def jump_toward(self, target_x: float, target_y: float):
-        """Launch sprite toward a target position with a parabolic arc."""
         if self._state in (PhysicsState.DRAGGED, PhysicsState.PUSHING_WINDOW):
             return
         pos = self._window.pos()
         x, y = float(pos.x()), float(pos.y())
-        dx = target_x - x
-        dy = target_y - y
+        dx, dy = target_x - x, target_y - y
         dist = max(1.0, (dx * dx + dy * dy) ** 0.5)
-        # normalize and apply impulse; always have a minimum upward component
         self._vel.x = (dx / dist) * JUMP_IMPULSE_X
         self._vel.y = min(JUMP_MIN_HEIGHT, (dy / dist) * JUMP_IMPULSE_Y)
-        self._reset_window_pull()
-        self._hanging = False
-        self._climbing_window = None
+        self._pull.reset()
+        self._climb.hanging = False
+        self._climb.window = None
         self._state = PhysicsState.FALLING
         self._set_posture(PostureState.FALLING)
         self.locomotion_action.emit("jump")
 
     def jump_burst(self, direction: int = 1):
-        """Burst outward (for subagent spawn). direction: 1=right, -1=left."""
         self._vel.x = direction * JUMP_IMPULSE_X * 0.8
         self._vel.y = JUMP_IMPULSE_Y * 0.6
         self._state = PhysicsState.FALLING
         self._set_posture(PostureState.FALLING)
 
-    # --- window interaction: push/drag ---
+    # --- window interactions: push / peek / throw ---
 
     def start_window_push(self, window_rect: QRect, pid: int, corner: str):
-        """Start pushing a window. corner: "left" or "right"."""
         if self._state in (PhysicsState.DRAGGED, PhysicsState.FALLING):
             return
-        self._push_window_info = (window_rect, pid)
-        self._push_corner = corner
-        self._push_ticks = random.randint(*WINDOW_PUSH_DURATION)
-        # push direction: from left corner → push right, from right corner → push left
-        self._push_dir = 1 if corner == "left" else -1
-        # face the window (opposite of push direction)
+        self._push = PushState(
+            window=(window_rect, pid),
+            corner=corner,
+            ticks=random.randint(*WINDOW_PUSH_DURATION),
+            direction=1 if corner == "left" else -1,
+        )
         self._set_facing("right" if corner == "left" else "left")
         self._state = PhysicsState.PUSHING_WINDOW
         self._set_posture(PostureState.PUSHING)
-        self._reset_window_pull()
+        self._pull.reset()
         self.locomotion_action.emit("window_push")
 
     def start_window_peek(self, window_rect: QRect, pid: int, corner: str):
-        """Start peeking from a window corner."""
         if self._state in (PhysicsState.DRAGGED, PhysicsState.FALLING):
             return
-        self._push_window_info = (window_rect, pid)  # reuse for position reference
-        self._peek_corner = corner
+        self._push.window = (window_rect, pid)  # reuse for position reference
         self._peek_ticks = random.randint(*WINDOW_PEEK_DURATION)
         self._set_facing("right" if corner == "left" else "left")
         self._state = PhysicsState.PEEKING
@@ -340,20 +543,14 @@ class PhysicsEngine(QObject):
         self.locomotion_action.emit("window_peek")
 
     def start_window_throw(self, window_rect: QRect, pid: int, corner: str):
-        """Grab a window corner and throw it. Emits window_throw signal for main to handle."""
         if self._state in (PhysicsState.DRAGGED, PhysicsState.FALLING):
             return
-        # face the window, throw direction is AWAY from window (over shoulder)
         self._set_facing("right" if corner == "left" else "left")
         throw_dir = "left" if corner == "left" else "right"
         self.locomotion_action.emit("window_throw")
         self.window_throw.emit(pid, window_rect, throw_dir)
 
-    def set_offset(self, dx: float, dy: float):
-        """Set debug position offset."""
-        self._offset = Vec2(dx, dy)
-
-    # --- main tick ---
+    # --- main tick: dispatch to per-state handlers ---
 
     def _tick(self):
         if self._dragged:
@@ -369,255 +566,534 @@ class PhysicsEngine(QObject):
         left_x  = screen.left()
         right_x = screen.right() - w
 
+        bounds = (screen_floor, ceil_y, left_x, right_x)
+
         if self._state == PhysicsState.FALLING:
-            self._vel.y = min(self._vel.y + GRAVITY, MAX_FALL_SPEED)
-            old_y = y
-            x += self._vel.x
-            y += self._vel.y
-
-            target_floor = self._find_surface_below(x, old_y, screen_floor)
-            if y >= target_floor:
-                y = target_floor
-                self._vel.y = 0
-                self._vel.x = 0
-                self._land(target_floor)
-            elif y <= ceil_y:
-                y = ceil_y
-                self._vel.y = abs(self._vel.y) * 0.3
-
-            # hard clamp: never fall below the screen floor
-            if y > screen_floor:
-                y = screen_floor
-                self._vel.y = 0
-                self._vel.x = 0
-                self._land(screen_floor)
-
-            if x <= left_x:
-                x = left_x
-                if not self._event_locked and random.random() < self._restless_wall_grab_chance():
-                    self._start_wall_climb(PhysicsState.WALL_LEFT)
-                else:
-                    self._vel.x = abs(self._vel.x) * 0.5
-            elif x >= right_x:
-                x = right_x
-                if not self._event_locked and random.random() < self._restless_wall_grab_chance():
-                    self._start_wall_climb(PhysicsState.WALL_RIGHT)
-                else:
-                    self._vel.x = -abs(self._vel.x) * 0.5
-
+            x, y = self._tick_falling(x, y, bounds)
         elif self._state == PhysicsState.GROUNDED:
-            self._vel.x *= 0.7
-            if abs(self._vel.x) < 0.5:
-                self._vel.x = 0.0
-
-            if not self._event_locked:
-                self._wander_ticks -= 1
-                if self._wander_ticks <= 0:
-                    self._decide_wander()
-
-                speed = RUN_SPEED if self._running else WALK_SPEED
-                x += self._walk_dir * speed
-
-                if x <= left_x:
-                    x = left_x
-                    # walking into walls: much lower grab chance (climbing is for intentional jumps)
-                    if random.random() < self._restless_wall_grab_chance() * 0.3:
-                        self._reset_window_pull()
-                        self._start_wall_climb(PhysicsState.WALL_LEFT)
-                    else:
-                        self._walk_dir = 1
-                        self._set_facing("right")
-                        self.locomotion_action.emit("walk")
-                elif x >= right_x:
-                    x = right_x
-                    if random.random() < self._restless_wall_grab_chance() * 0.3:
-                        self._reset_window_pull()
-                        self._start_wall_climb(PhysicsState.WALL_RIGHT)
-                    else:
-                        self._walk_dir = -1
-                        self._set_facing("left")
-                        self.locomotion_action.emit("walk")
-                elif self._walk_dir != 0:
-                    # check if walking into the side of a window
-                    wall_hit = self._window_wall_at(x, self._walk_dir)
-                    if wall_hit and random.random() < self._restless_wall_grab_chance() * 0.3:
-                        wall_side, w_rect, w_pid = wall_hit
-                        self._reset_window_pull()
-                        wall_state = PhysicsState.WALL_RIGHT if wall_side == "right" else PhysicsState.WALL_LEFT
-                        self._start_wall_climb(wall_state, window_info=(w_rect, w_pid))
-
-            # sitting timer
-            if self._walk_dir == 0 and not self._event_locked:
-                self._still_ticks += 1
-                if self._still_ticks >= SITTING_TIMEOUT and self._posture != PostureState.SITTING:
-                    self._set_posture(PostureState.SITTING)
-            else:
-                self._still_ticks = 0
-
-            # window pull: sprite weight gradually drags the window down
-            if (self._standing_on_window is not None
-                    and WINDOW_PULL_DISTANCE > 0
-                    and self._window_pull_applied < WINDOW_PULL_DISTANCE):
-                self._pull_tick_counter += 1
-                if self._pull_tick_counter >= WINDOW_PULL_INTERVAL:
-                    self._pull_tick_counter = 0
-                    delta = min(WINDOW_PULL_SPEED * WINDOW_PULL_INTERVAL,
-                                WINDOW_PULL_DISTANCE - self._window_pull_applied)
-                    if delta > 0:
-                        rect, pid = self._standing_on_window
-                        self._window_pull_applied += delta
-                        self._floor_y += delta
-                        y += delta
-                        self.pull_window.emit(pid, rect, delta)
-
-            # edge detection: walked off a surface?
-            if not self._surface_at(x, self._floor_y, screen_floor):
-                self._reset_window_pull()
-                self._state = PhysicsState.FALLING
-                self._set_posture(PostureState.FALLING)
-                self.locomotion_action.emit("fall")
-
+            x, y = self._tick_grounded(x, y, bounds)
         elif self._state in (PhysicsState.WALL_LEFT, PhysicsState.WALL_RIGHT):
-            x = self._climb_x
-            on_screen_edge = (abs(x - left_x) < 2.0 or abs(x - right_x) < 2.0)
-
-            if self._hanging:
-                # hanging: just dangle, don't climb
-                self._climb_ticks -= 1
-                if self._climb_ticks <= 0:
-                    self._hanging = False
-                    self._climbing_window = None
-                    self._state = PhysicsState.FALLING
-                    self._set_posture(PostureState.FALLING)
-                    self.locomotion_action.emit("fall")
-            else:
-                # climbing upward
-                y -= CLIMB_SPEED
-
-                # side-climbing a window: pull it down
-                if self._climbing_window is not None:
-                    self._side_pull_counter += 1
-                    if self._side_pull_counter >= SIDE_PULL_INTERVAL:
-                        self._side_pull_counter = 0
-                        cw_rect, cw_pid = self._climbing_window
-                        delta = SIDE_PULL_SPEED * SIDE_PULL_INTERVAL
-                        self.pull_window.emit(cw_pid, cw_rect, delta)
-
-                if on_screen_edge and y <= ceil_y:
-                    # reached the top of a screen wall — transition to ceiling
-                    y = float(ceil_y)
-                    self._ceiling_dir = 1 if self._state == PhysicsState.WALL_LEFT else -1
-                    self._state = PhysicsState.CEILING
-                    self._climb_ticks = random.randint(*CEILING_DURATION)
-                    self._hanging = False
-                    self._climbing_window = None
-                    self._set_posture(PostureState.CEILING)
-                    self._set_facing("right" if self._ceiling_dir > 0 else "left")
-                    self.locomotion_action.emit("ceiling")
-                else:
-                    self._climb_ticks -= 1
-                    # check if reached top of a window we're climbing
-                    top_of_surface = self._find_surface_below(x, y - 1, screen_floor)
-                    climbed_over = not on_screen_edge and top_of_surface < y
-                    if climbed_over:
-                        # reached window top — jump inward so she lands on the surface
-                        # (not teetering on the edge where she'd immediately fall off)
-                        self._climbing_window = None
-                        self._hanging = False
-                        inward = 20.0  # px inward from the wall edge
-                        if self._state == PhysicsState.WALL_LEFT:
-                            x += inward
-                        else:
-                            x -= inward
-                        y = top_of_surface
-                        self._land(top_of_surface)
-                    elif self._climb_ticks <= 0:
-                        # climb duration expired — hang or fall
-                        if random.random() < HANG_CHANCE:
-                            self._hanging = True
-                            self._climb_ticks = random.randint(*HANG_DURATION)
-                            self._set_posture(PostureState.HANGING)
-                            self.locomotion_action.emit("hang")
-                        else:
-                            self._hanging = False
-                            self._climbing_window = None
-                            self._state = PhysicsState.FALLING
-                            self._set_posture(PostureState.FALLING)
-                            self.locomotion_action.emit("fall")
-
+            x, y = self._tick_wall(x, y, bounds)
         elif self._state == PhysicsState.CEILING:
-            y = float(ceil_y)
-            if self._hanging:
-                # hanging from ceiling: stationary
-                self._climb_ticks -= 1
-                if self._climb_ticks <= 0:
-                    self._hanging = False
-                    self._state = PhysicsState.FALLING
-                    self._set_posture(PostureState.FALLING)
-                    self.locomotion_action.emit("fall")
-            else:
-                # crawl along ceiling, flip sprite when bouncing off screen edges
-                prev_dir = self._ceiling_dir
-                x += self._ceiling_dir * CEILING_CRAWL_SPEED
-                if x <= left_x:
-                    x = float(left_x)
-                    self._ceiling_dir = 1
-                elif x >= right_x:
-                    x = float(right_x)
-                    self._ceiling_dir = -1
-                if self._ceiling_dir != prev_dir:
-                    self._set_facing("right" if self._ceiling_dir > 0 else "left")
-                    self.locomotion_action.emit("ceiling")
-                self._climb_ticks -= 1
-                if self._climb_ticks <= 0:
-                    # maybe hang instead of falling
-                    if random.random() < HANG_CHANCE:
-                        self._hanging = True
-                        self._climb_ticks = random.randint(*HANG_DURATION)
-                        self._set_posture(PostureState.HANGING)
-                        self.locomotion_action.emit("hang_ceiling")
-                    else:
-                        self._state = PhysicsState.FALLING
-                        self._set_posture(PostureState.FALLING)
-                        self.locomotion_action.emit("fall")
-
+            x, y = self._tick_ceiling(x, y, bounds)
         elif self._state == PhysicsState.PUSHING_WINDOW:
-            # walking slowly while pushing/dragging a window
-            x += self._push_dir * WINDOW_PUSH_SPEED
-            self._push_ticks -= 1
-
-            # emit window move signal periodically
-            if self._push_window_info and self._push_ticks % WINDOW_PUSH_EMIT_INTERVAL == 0:
-                pw_rect, pw_pid = self._push_window_info
-                dx_push = self._push_dir * WINDOW_PUSH_SPEED * WINDOW_PUSH_EMIT_INTERVAL
-                self.push_window_move.emit(pw_pid, pw_rect, dx_push, 0)
-
-            # done pushing, or hit screen edge
-            if self._push_ticks <= 0 or x <= left_x or x >= right_x:
-                x = max(float(left_x), min(x, float(right_x)))
-                self._push_window_info = None
-                self._state = PhysicsState.GROUNDED
-                self._set_posture(PostureState.STANDING)
-                self._schedule_wander()
-                # no emission — hold last frame, wander timer will pick next action
-
+            x, y = self._tick_pushing(x, y, bounds)
         elif self._state == PhysicsState.PEEKING:
-            # peeking from window corner: stationary, countdown
-            self._peek_ticks -= 1
-            if self._peek_ticks <= 0:
-                self._push_window_info = None
-                self._state = PhysicsState.GROUNDED
-                self._set_posture(PostureState.STANDING)
-                self._schedule_wander()
-                # no emission — hold last frame, wander timer will pick next action
+            x, y = self._tick_peeking(x, y, bounds)
 
-        # final safety clamp: never let her leave the screen bounds
+        # safety clamp
         x = max(float(left_x), min(x, float(right_x)))
         y = max(float(ceil_y), min(y, screen_floor))
 
-        # apply debug offset (doesn't affect physics, just rendering position)
         self._window.move(int(x + self._offset.x), int(y + self._offset.y))
 
+    # --- per-state tick handlers ---
+
+    def _tick_falling(self, x, y, bounds):
+        screen_floor, ceil_y, left_x, right_x = bounds
+        miku_w, miku_h = float(self._window.width()), float(self._window.height())
+
+        self._vel.y = min(self._vel.y + GRAVITY, MAX_FALL_SPEED)
+        old_y = y
+        x += self._vel.x
+        y += self._vel.y
+
+        # land on surface
+        target_floor = _find_surface_below(self._platforms, x, old_y, miku_w, miku_h, screen_floor)
+        if y >= target_floor:
+            y = target_floor
+            self._vel = Vec2()
+            self._land(target_floor)
+        elif y <= ceil_y:
+            y = ceil_y
+            if self._thrown and not self._event_locked:
+                # thrown into ceiling — grab on!
+                self._thrown = False
+                self._climb.ceiling_dir = 1 if self._vel.x >= 0 else -1
+                self._vel = Vec2()
+                self._state = PhysicsState.CEILING
+                self._climb.ticks = random.randint(*CEILING_DURATION)
+                self._climb.hanging = False
+                self._climb.window = None
+                self._set_posture(PostureState.CEILING)
+                self._set_facing("right" if self._climb.ceiling_dir > 0 else "left")
+                self.locomotion_action.emit("ceiling")
+            else:
+                self._vel.y = abs(self._vel.y) * 0.3
+
+        # hard clamp: never fall below screen
+        if y > screen_floor:
+            y = screen_floor
+            self._vel = Vec2()
+            self._land(screen_floor)
+
+        # wall grab on screen edges — thrown sprites grab much more reliably
+        grab_chance = THROWN_WALL_GRAB_CHANCE if self._thrown else self._wall_grab_chance()
+        if x <= left_x:
+            x = left_x
+            if not self._event_locked and random.random() < grab_chance:
+                self._thrown = False
+                self._start_wall_climb(PhysicsState.WALL_LEFT)
+            else:
+                self._vel.x = abs(self._vel.x) * 0.5
+        elif x >= right_x:
+            x = right_x
+            if not self._event_locked and random.random() < grab_chance:
+                self._thrown = False
+                self._start_wall_climb(PhysicsState.WALL_RIGHT)
+            else:
+                self._vel.x = -abs(self._vel.x) * 0.5
+
+        return x, y
+
+    def _tick_grounded(self, x, y, bounds):
+        screen_floor, _, left_x, right_x = bounds
+        miku_w, miku_h = float(self._window.width()), float(self._window.height())
+
+        # friction
+        self._vel.x *= 0.7
+        if abs(self._vel.x) < 0.5:
+            self._vel.x = 0.0
+
+        if not self._event_locked:
+            self._wander_ticks -= 1
+            if self._wander_ticks <= 0:
+                self._decide_wander()
+
+            if self._action_walk_speed > 0:
+                speed = self._action_walk_speed
+            elif self._sprinting:
+                speed = SPRINT_SPEED
+            elif self._running:
+                speed = RUN_SPEED
+            else:
+                speed = WALK_SPEED
+            x += self._walk_dir * speed
+
+            # wall collisions
+            x, climbed = self._handle_ground_walls(x, left_x, right_x)
+            if climbed:
+                return x, y
+
+            # windows are below her z-level — she walks freely in front of them.
+            # window climbing is only triggered deliberately via _try_special_behavior.
+
+        # sitting timer
+        if self._walk_dir == 0 and not self._event_locked:
+            self._still_ticks += 1
+            if self._still_ticks >= SITTING_TIMEOUT and self._posture != PostureState.SITTING:
+                self._set_posture(PostureState.SITTING)
+        else:
+            self._still_ticks = 0
+
+        # window pull (sprite weight)
+        y = self._tick_window_pull(y)
+
+        # edge detection: walked off surface?
+        if not _surface_at(self._platforms, x, self._floor_y, miku_w, miku_h, screen_floor):
+            self._pull.reset()
+            # deliberate edge leap: sometimes jump off instead of just falling
+            if (self._walk_dir != 0
+                    and not self._event_locked
+                    and random.random() < EDGE_LEAP_CHANCE):
+                self._vel.x = self._walk_dir * EDGE_LEAP_IMPULSE_X
+                self._vel.y = EDGE_LEAP_IMPULSE_Y
+                self._state = PhysicsState.FALLING
+                self._set_posture(PostureState.FALLING)
+                self.locomotion_action.emit("jump")
+            else:
+                self._start_falling()
+
+        return x, y
+
+    def _handle_ground_walls(self, x, left_x, right_x) -> tuple[float, bool]:
+        """Handle screen-edge collisions while grounded. Returns (x, climbed)."""
+        grab_chance = self._wall_grab_chance() * 0.3
+        if x <= left_x:
+            x = left_x
+            if random.random() < grab_chance:
+                self._pull.reset()
+                self._start_wall_climb(PhysicsState.WALL_LEFT)
+                return x, True
+            self._walk_dir = 1
+            self._set_facing("right")
+            self.locomotion_action.emit("walk")
+        elif x >= right_x:
+            x = right_x
+            if random.random() < grab_chance:
+                self._pull.reset()
+                self._start_wall_climb(PhysicsState.WALL_RIGHT)
+                return x, True
+            self._walk_dir = -1
+            self._set_facing("left")
+            self.locomotion_action.emit("walk")
+        return x, False
+
+    def _tick_window_pull(self, y) -> float:
+        """Apply sprite weight pulling a window down. Returns updated y."""
+        pull = self._pull
+        if (pull.standing_on is not None
+                and WINDOW_PULL_DISTANCE > 0
+                and pull.applied < WINDOW_PULL_DISTANCE):
+            pull.tick_counter += 1
+            if pull.tick_counter >= WINDOW_PULL_INTERVAL:
+                pull.tick_counter = 0
+                delta = min(WINDOW_PULL_SPEED * WINDOW_PULL_INTERVAL,
+                            WINDOW_PULL_DISTANCE - pull.applied)
+                if delta > 0:
+                    rect, pid = pull.standing_on
+                    pull.applied += delta
+                    self._floor_y += delta
+                    y += delta
+                    self.pull_window.emit(pid, rect, delta)
+        return y
+
+    def _tick_wall(self, x, y, bounds):
+        screen_floor, ceil_y, left_x, right_x = bounds
+        miku_w, miku_h = float(self._window.width()), float(self._window.height())
+        x = self._climb.pin_x
+        on_screen_edge = (abs(x - left_x) < 2.0 or abs(x - right_x) < 2.0)
+
+        if self._climb.hanging:
+            self._climb.ticks -= 1
+            if self._climb.ticks <= 0:
+                self._climb.hanging = False
+                self._climb.window = None
+                self._start_falling()
+            return x, y
+
+        # actively climbing upward
+        y -= CLIMB_SPEED
+
+        # climbing behind another window? fall off before going too deep
+        if self._climb.window is not None and not on_screen_edge:
+            cw_rect, cw_pid = self._climb.window
+            side = "left" if self._state == PhysicsState.WALL_LEFT else "right"
+            if self._is_occluded_side(cw_rect, cw_pid, side, y, y + miku_h):
+                self._climb.window = None
+                self._climb.hanging = False
+                self._start_falling()
+                return x, y
+
+        # side-climbing a window: pull it down
+        if self._climb.window is not None:
+            self._climb.side_pull_counter += 1
+            if self._climb.side_pull_counter >= SIDE_PULL_INTERVAL:
+                self._climb.side_pull_counter = 0
+                cw_rect, cw_pid = self._climb.window
+                self.pull_window.emit(cw_pid, cw_rect, SIDE_PULL_SPEED * SIDE_PULL_INTERVAL)
+
+        # reached top of screen wall → transition to ceiling
+        if on_screen_edge and y <= ceil_y:
+            y = float(ceil_y)
+            self._climb.ceiling_dir = 1 if self._state == PhysicsState.WALL_LEFT else -1
+            self._state = PhysicsState.CEILING
+            self._climb.ticks = random.randint(*CEILING_DURATION)
+            self._climb.hanging = False
+            self._climb.window = None
+            self._set_posture(PostureState.CEILING)
+            self._set_facing("right" if self._climb.ceiling_dir > 0 else "left")
+            self.locomotion_action.emit("ceiling")
+            return x, y
+
+        self._climb.ticks -= 1
+
+        # reached top of a window we're climbing
+        top_of_surface = _find_surface_below(self._platforms, x, y - 1, miku_w, miku_h, screen_floor)
+        if not on_screen_edge and top_of_surface < y:
+            # jump inward so she lands on the surface (not teetering on edge)
+            self._climb.window = None
+            self._climb.hanging = False
+            inward = 20.0
+            if self._state == PhysicsState.WALL_LEFT:
+                x += inward
+            else:
+                x -= inward
+            y = top_of_surface
+            self._land(top_of_surface)
+        elif self._climb.ticks <= 0:
+            self._maybe_hang_or_fall("hang")
+
+        return x, y
+
+    def _tick_ceiling(self, x, y, bounds):
+        _, ceil_y, left_x, right_x = bounds
+        y = float(ceil_y)
+
+        if self._climb.hanging:
+            self._climb.ticks -= 1
+            if self._climb.ticks <= 0:
+                self._climb.hanging = False
+                self._start_falling()
+            return x, y
+
+        # crawl along ceiling
+        prev_dir = self._climb.ceiling_dir
+        x += self._climb.ceiling_dir * CEILING_CRAWL_SPEED
+        if x <= left_x:
+            x = float(left_x)
+            self._climb.ceiling_dir = 1
+        elif x >= right_x:
+            x = float(right_x)
+            self._climb.ceiling_dir = -1
+        if self._climb.ceiling_dir != prev_dir:
+            self._set_facing("right" if self._climb.ceiling_dir > 0 else "left")
+            self.locomotion_action.emit("ceiling")
+
+        self._climb.ticks -= 1
+        if self._climb.ticks <= 0:
+            self._maybe_hang_or_fall("hang_ceiling")
+
+        return x, y
+
+    def _tick_pushing(self, x, y, bounds):
+        _, _, left_x, right_x = bounds
+        push = self._push
+
+        x += push.direction * WINDOW_PUSH_SPEED
+        push.ticks -= 1
+
+        if push.window and push.ticks % WINDOW_PUSH_EMIT_INTERVAL == 0:
+            pw_rect, pw_pid = push.window
+            dx_push = push.direction * WINDOW_PUSH_SPEED * WINDOW_PUSH_EMIT_INTERVAL
+            self.push_window_move.emit(pw_pid, pw_rect, dx_push, 0)
+
+        if push.ticks <= 0 or x <= left_x or x >= right_x:
+            x = max(float(left_x), min(x, float(right_x)))
+            self._return_to_ground()
+
+        return x, y
+
+    def _tick_peeking(self, x, y, _bounds):
+        self._peek_ticks -= 1
+        if self._peek_ticks <= 0:
+            self._return_to_ground()
+        return x, y
+
+    # --- wander decisions ---
+
+    def _schedule_wander(self):
+        mul = _restless_params(self._restlessness)[0]
+        lo = int(IDLE_WANDER_INTERVAL[0] * mul)
+        hi = int(IDLE_WANDER_INTERVAL[1] * mul)
+        self._wander_ticks = random.randint(max(1, lo), max(2, hi))
+
+    def _decide_wander(self):
+        rest = self._restlessness
+
+        # at higher restlessness, try special behaviors first
+        if rest >= 2 and not self._event_locked:
+            if self._try_special_behavior(rest):
+                self._schedule_wander()
+                return
+
+        # trip check: if currently running/sprinting, small chance to stumble
+        if (self._running or self._sprinting) and rest >= 2:
+            trip_chance = TRIP_CHANCE.get(rest, 0)
+            if random.random() < trip_chance:
+                self._walk_dir = 0
+                self._running = False
+                self._sprinting = False
+                self._set_posture(PostureState.STANDING)
+                self.locomotion_action.emit("trip")
+                self._schedule_wander()
+                return
+
+        # movement options with weights
+        calm = rest <= 1
+        direction = random.choice([-1, 1])
+        options = [
+            ("walk",   0.35 if calm else 0.20),
+            ("stand",  0.20 if calm else 0.10),
+            ("idle",   0.10 if calm else 0.05),
+            ("crawl",  0.05 if calm else 0.10),  # deliberate belly crawl
+        ]
+        if rest >= 2:
+            options.append(("run", 0.25))
+        if rest >= 3:
+            options.append(("sprint", 0.15))
+
+        choice = _weighted_choice(options)
+
+        if choice == "walk":
+            self._start_walking(direction)
+        elif choice == "run":
+            self._start_walking(direction, run=True)
+        elif choice == "sprint":
+            self._start_walking(direction, sprint=True)
+        elif choice == "crawl":
+            # deliberate crawl: physics moves her via action_walk_speed feedback
+            self._walk_dir = direction
+            self._still_ticks = 0
+            self._running = False
+            self._sprinting = False
+            self._following_cursor = False
+            self._set_posture(PostureState.WALKING)
+            self._set_facing("left" if direction < 0 else "right")
+            self.locomotion_action.emit("crawl")
+        elif choice == "idle":
+            self._walk_dir = 0
+            self._running = False
+            self._sprinting = False
+            self._following_cursor = False
+            self._set_posture(PostureState.STANDING)
+            self.locomotion_action.emit("idle")
+        else:
+            # stand: stop, hold frame, wander timer picks next
+            self._walk_dir = 0
+            self._running = False
+            self._sprinting = False
+            self._following_cursor = False
+            self._set_posture(PostureState.STANDING)
+
+        self._schedule_wander()
+
+    def _try_special_behavior(self, rest: int) -> bool:
+        """Roll for cursor-follow, nearby window, or window-seek. Returns True if triggered."""
+        roll = random.random()
+        cursor_chance = CURSOR_FOLLOW_CHANCE.get(rest, 0)
+        window_near_chance = 0.15 if rest >= 2 else 0
+        window_seek_chance = WINDOW_SEEK_CHANCE.get(rest, 0)
+
+        # cumulative thresholds
+        t_cursor = cursor_chance
+        t_near = t_cursor + window_near_chance
+        t_seek = t_near + window_seek_chance
+
+        if roll < t_cursor:
+            if self._try_cursor_follow():
+                return True
+        elif roll < t_near:
+            nearby = self._nearby_window()
+            if nearby:
+                corner, w_rect, w_pid = nearby
+                self._do_window_interaction(w_rect, w_pid, corner)
+                return True
+        elif roll < t_seek:
+            target = self._pick_random_window()
+            if target:
+                corner, w_rect, w_pid = target
+                target_x = float(w_rect.left() if corner == "left" else w_rect.right())
+                target_y = float(w_rect.top()) - self._window.height()
+                self.jump_toward(target_x, target_y)
+                return True
+
+        return False
+
+    def _do_window_interaction(self, w_rect, w_pid, corner):
+        rest = self._restlessness
+        roll = random.random()
+        if rest >= 4 and roll < 0.25:
+            self.start_window_throw(w_rect, w_pid, corner)
+        elif rest >= 3 and roll < 0.50:
+            self.start_window_push(w_rect, w_pid, corner)
+        elif roll < 0.60:
+            self.start_window_peek(w_rect, w_pid, corner)
+        else:
+            self.start_window_push(w_rect, w_pid, corner)
+
+    def _try_cursor_follow(self) -> bool:
+        try:
+            cursor = QCursor.pos()
+        except Exception:
+            return False
+        pos = self._window.pos()
+        mx = float(pos.x()) + self._window.width() / 2
+        my = float(pos.y()) + self._window.height() / 2
+        cx, cy = float(cursor.x()), float(cursor.y())
+        dx, dy = cx - mx, cy - my
+        dist = (dx * dx + dy * dy) ** 0.5
+
+        if dist < 30:
+            return False
+
+        if dist < CURSOR_JUMP_DISTANCE and random.random() < CURSOR_JUMP_CHANCE:
+            self.jump_toward(cx, cy)
+            self._following_cursor = True
+            return True
+
+        self._start_walking(1 if dx > 0 else -1, run=self._restlessness >= 3)
+        self._following_cursor = True
+        return True
+
+    # --- surface/window queries ---
+
+    def _window_wall_at(self, x: float, walk_dir: int):
+        """Check if walking into the side of a window. Returns (wall_side, QRect, pid) or None.
+        Only matches windows that actually extend down to miku's level and aren't
+        occluded by another window in front. Used for deliberate climb targeting,
+        not for walk collision."""
+        miku_w = float(self._window.width())
+        miku_h = float(self._window.height())
+        miku_y = float(self._window.pos().y())
+        miku_bottom = miku_y + miku_h
+        tolerance = 4.0
+
+        for rect, pid in self._platforms:
+            # window must overlap vertically with miku (not floating above or below)
+            if rect.top() >= miku_bottom or rect.bottom() <= miku_y:
+                continue
+            if walk_dir > 0:
+                wall_x = float(rect.left()) - miku_w
+                if abs(x - wall_x) < tolerance:
+                    if not self._is_occluded_side(rect, pid, "left", miku_y, miku_bottom):
+                        return ("right", rect, pid)
+            elif walk_dir < 0:
+                wall_x = float(rect.right())
+                if abs(x - wall_x) < tolerance:
+                    if not self._is_occluded_side(rect, pid, "right", miku_y, miku_bottom):
+                        return ("left", rect, pid)
+        return None
+
+    def _is_occluded_side(self, target_rect: QRect, target_pid: int,
+                          side: str, y_top: float, y_bottom: float) -> bool:
+        """Check if another window covers the target window's side at miku's height.
+        Platforms are front-to-back ordered, so any earlier entry that covers the
+        target's side means it's occluded."""
+        edge_x = float(target_rect.left()) if side == "left" else float(target_rect.right())
+        for rect, pid in self._platforms:
+            if pid == target_pid:
+                break  # reached the target itself — nothing in front occludes it
+            # does this window cover the target's edge at miku's height?
+            if (rect.left() <= edge_x <= rect.right()
+                    and rect.top() < y_bottom and rect.bottom() > y_top):
+                return True
+        return False
+
+    def _nearby_window(self, max_dist: float = 100.0):
+        """Find a window near miku for interaction. Returns (corner, QRect, pid) or None."""
+        miku_w = float(self._window.width())
+        miku_h = float(self._window.height())
+        pos = self._window.pos()
+        mx, my = float(pos.x()), float(pos.y())
+        miku_bottom = my + miku_h
+
+        for rect, pid in self._platforms:
+            if abs(rect.top() - miku_bottom) > max_dist:
+                continue
+            if abs(mx - rect.left()) < max_dist:
+                return ("left", rect, pid)
+            if abs((mx + miku_w) - rect.right()) < max_dist:
+                return ("right", rect, pid)
+        return None
+
+    def _pick_random_window(self):
+        """Pick a random window to walk/jump toward. Returns (corner, QRect, pid) or None."""
+        if not self._platforms:
+            return None
+        miku_h = float(self._window.height())
+        miku_bottom = float(self._window.pos().y()) + miku_h
+        mx = float(self._window.pos().x())
+
+        candidates = []
+        for rect, pid in self._platforms:
+            if abs(rect.top() - miku_bottom) < 200:
+                left_dist = abs(mx - rect.left())
+                right_dist = abs(mx - rect.right())
+                corner = "left" if left_dist < right_dist else "right"
+                candidates.append((corner, rect, pid))
+
+        return random.choice(candidates) if candidates else None
 
     # --- helpers ---
 
@@ -631,320 +1107,7 @@ class PhysicsEngine(QObject):
             self._facing = direction
             self.facing_changed.emit(direction)
 
-    def _land(self, floor_y: float):
-        self._floor_y = floor_y
-        self._state = PhysicsState.GROUNDED
-        self._walk_dir = 0
-        self._still_ticks = 0
-        self._running = False
-        self._set_posture(PostureState.STANDING)
-        self._schedule_wander()
-        # signal landing so fall animation can play its outro and finish
-        self.locomotion_action.emit("land")
-        # check if we landed on a window (for weight-pulling)
-        self._standing_on_window = self._find_platform_at(floor_y)
-        self._window_pull_applied = 0.0
-        self._pull_tick_counter = 0
-
-    def _start_wall_climb(self, wall: PhysicsState, window_info: tuple | None = None):
-        self._state = wall
-        self._vel = Vec2()
-        self._climb_ticks = random.randint(*self._restless_climb_duration())
-        self._climb_x = float(self._window.pos().x())  # pin to current x
-        self._hanging = False
-        self._climbing_window = window_info  # (QRect, pid) if climbing a window, None for screen edge
-        self._side_pull_counter = 0
-        self._set_posture(PostureState.CLIMBING)
-        # left wall: sprite faces left (toward wall). right wall: faces right.
-        self._set_facing("left" if wall == PhysicsState.WALL_LEFT else "right")
-        self.locomotion_action.emit("climb")
-
-    def _unpack_platform(self, entry) -> tuple:
-        """Unpack a platform entry: (QRect, pid) or bare QRect → (QRect, pid)."""
-        if isinstance(entry, tuple):
-            return entry[0], entry[1]
-        return entry, 0  # bare QRect, no pid
-
-    def _find_surface_below(self, x: float, y_from: float, screen_floor: float) -> float:
-        """Highest surface at position x that is at or below y_from (first thing she'd land on)."""
-        miku_w = float(self._window.width())
-        miku_h = float(self._window.height())
-        best = screen_floor
-        for entry in self._platforms:
-            platform, _pid = self._unpack_platform(entry)
-            if x + miku_w > platform.left() and x < platform.right():
-                surface = float(platform.top()) - miku_h
-                # must be at or below y_from (she's above it), and better than current best
-                if surface >= y_from and surface < best:
-                    best = surface
-        return best
-
-    def _surface_at(self, x: float, floor_y: float, screen_floor: float) -> bool:
-        """Is there a walkable surface at (x, floor_y)? Used for edge detection."""
-        miku_w = float(self._window.width())
-        miku_h = float(self._window.height())
-        if abs(floor_y - screen_floor) < SURFACE_TOLERANCE:
-            return True
-        for entry in self._platforms:
-            platform, _pid = self._unpack_platform(entry)
-            if x + miku_w > platform.left() and x < platform.right():
-                surface = float(platform.top()) - miku_h
-                if abs(surface - floor_y) < SURFACE_TOLERANCE:
-                    return True
-        return False
-
-    def _find_platform_at(self, floor_y: float):
-        """Find which platform we're standing on (if any). Returns (QRect, pid) or None."""
-        miku_w = float(self._window.width())
-        miku_h = float(self._window.height())
-        x = float(self._window.pos().x())
-        screen = self._screen_rect()
-        screen_floor = float(screen.bottom() - self._window.height())
-        # if standing on screen floor, not on a window
-        if abs(floor_y - screen_floor) < SURFACE_TOLERANCE:
-            return None
-        for entry in self._platforms:
-            platform, pid = self._unpack_platform(entry)
-            if x + miku_w > platform.left() and x < platform.right():
-                surface = float(platform.top()) - miku_h
-                if abs(surface - floor_y) < SURFACE_TOLERANCE:
-                    return (platform, pid)
-        return None
-
-    def _reset_window_pull(self):
-        """Reset window pull state (called when leaving a platform)."""
-        self._standing_on_window = None
-        self._window_pull_applied = 0.0
-        self._pull_tick_counter = 0
-
-    def _window_wall_at(self, x: float, walk_dir: int):
-        """Check if miku is walking into the side of a window.
-        Returns (wall_side, QRect, pid) or None. wall_side is 'left'/'right'."""
-        miku_w = float(self._window.width())
-        miku_h = float(self._window.height())
-        miku_y = float(self._window.pos().y())
-        miku_bottom = miku_y + miku_h
-        tolerance = 4.0
-
-        for entry in self._platforms:
-            platform, _pid = self._unpack_platform(entry)
-            # window must extend above miku's feet (something to climb)
-            if platform.top() >= miku_bottom:
-                continue
-            # walking right → hitting a window's left side
-            if walk_dir > 0:
-                wall_x = float(platform.left()) - miku_w
-                if abs(x - wall_x) < tolerance:
-                    return ("right", platform, _pid)
-            # walking left → hitting a window's right side
-            elif walk_dir < 0:
-                wall_x = float(platform.right())
-                if abs(x - wall_x) < tolerance:
-                    return ("left", platform, _pid)
-        return None
-
-    def _nearby_window(self, max_dist: float = 100.0):
-        """Find a window near miku's position for interaction.
-        Returns (corner, QRect, pid) or None. corner is 'left'/'right'."""
-        miku_w = float(self._window.width())
-        miku_h = float(self._window.height())
-        pos = self._window.pos()
-        mx, my = float(pos.x()), float(pos.y())
-        miku_bottom = my + miku_h
-
-        for entry in self._platforms:
-            platform, pid = self._unpack_platform(entry)
-            # window top must be near miku's feet (reachable height)
-            if abs(platform.top() - miku_bottom) > max_dist:
-                continue
-            # check left corner
-            if abs(mx - platform.left()) < max_dist:
-                return ("left", platform, pid)
-            # check right corner
-            if abs((mx + miku_w) - platform.right()) < max_dist:
-                return ("right", platform, pid)
-        return None
-
-    def _pick_random_window(self):
-        """Pick a random window to walk toward for interaction.
-        Returns (corner, QRect, pid) or None."""
-        if not self._platforms:
-            return None
-        miku_h = float(self._window.height())
-        miku_y = float(self._window.pos().y())
-        miku_bottom = miku_y + miku_h
-        screen = self._screen_rect()
-        screen_floor = float(screen.bottom() - self._window.height())
-
-        # only consider windows roughly at the same level (on the same surface)
-        candidates = []
-        for entry in self._platforms:
-            platform, pid = self._unpack_platform(entry)
-            # window top within ~200px of miku's feet vertically
-            if abs(platform.top() - miku_bottom) < 200:
-                # pick the closer corner
-                mx = float(self._window.pos().x())
-                left_dist = abs(mx - platform.left())
-                right_dist = abs(mx - platform.right())
-                corner = "left" if left_dist < right_dist else "right"
-                candidates.append((corner, platform, pid))
-
-        if not candidates:
-            return None
-        return random.choice(candidates)
-
-    def _schedule_wander(self):
-        mul = _RESTLESS_PARAMS.get(self._restlessness, _RESTLESS_PARAMS[0])[0]
-        lo  = int(IDLE_WANDER_INTERVAL[0] * mul)
-        hi  = int(IDLE_WANDER_INTERVAL[1] * mul)
-        self._wander_ticks = random.randint(max(1, lo), max(2, hi))
-
-    def _decide_wander(self):
-        rest = self._restlessness
-
-        # at higher restlessness, roll for special behaviors before falling back to walk/sit
-        if rest >= 2:
-            roll = random.random()
-            # divide the probability space among special behaviors
-            cursor_chance = CURSOR_FOLLOW_CHANCE.get(rest, 0)
-            window_near_chance = 0.15 if rest >= 2 else 0
-            window_seek_chance = WINDOW_SEEK_CHANCE.get(rest, 0)
-            # cumulative thresholds
-            t_cursor = cursor_chance
-            t_window_near = t_cursor + window_near_chance
-            t_window_seek = t_window_near + window_seek_chance
-
-            if roll < t_cursor:
-                if self._try_cursor_follow():
-                    self._schedule_wander()
-                    return
-
-            elif roll < t_window_near:
-                nearby = self._nearby_window()
-                if nearby:
-                    corner, w_rect, w_pid = nearby
-                    self._do_window_interaction(w_rect, w_pid, corner)
-                    self._schedule_wander()
-                    return
-
-            elif roll < t_window_seek:
-                target = self._pick_random_window()
-                if target:
-                    corner, w_rect, w_pid = target
-                    # jump toward the window — much more dynamic than walking
-                    target_x = float(w_rect.left() if corner == "left" else w_rect.right())
-                    target_y = float(w_rect.top()) - self._window.height()
-                    self.jump_toward(target_x, target_y)
-                    self._schedule_wander()
-                    return
-
-        # all movement options are weighted choices — no default dominates
-        use_run = rest >= 2 and random.random() < 0.3
-        options = []
-
-        # walk/run (always available, dominant at low restlessness)
-        walk_w = 0.35 if rest <= 1 else 0.25
-        options.append(("walk_left", walk_w))
-        options.append(("walk_right", walk_w))
-
-        # stand still (just hold pose, no animation change)
-        stand_w = 0.20 if rest <= 1 else 0.10
-        options.append(("stand", stand_w))
-
-        # idle animation (sit_idle / idle tiers — a deliberate behavior, not a default)
-        idle_w = 0.10 if rest <= 1 else 0.05
-        options.append(("idle", idle_w))
-
-        # weighted random pick
-        total = sum(w for _, w in options)
-        roll = random.random() * total
-        cumulative = 0.0
-        choice = "stand"
-        for name, weight in options:
-            cumulative += weight
-            if roll < cumulative:
-                choice = name
-                break
-
-        if choice == "walk_left":
-            self._walk_dir = -1
-            self._still_ticks = 0
-            self._running = use_run
-            self._following_cursor = False
-            self._set_posture(PostureState.WALKING)
-            self._set_facing("left")
-            self.locomotion_action.emit("run" if use_run else "walk")
-        elif choice == "walk_right":
-            self._walk_dir = 1
-            self._still_ticks = 0
-            self._running = use_run
-            self._following_cursor = False
-            self._set_posture(PostureState.WALKING)
-            self._set_facing("right")
-            self.locomotion_action.emit("run" if use_run else "walk")
-        elif choice == "idle":
-            # deliberate idle animation — main.py resolves to sit_idle/idle1-5
-            self._walk_dir = 0
-            self._running = False
-            self._following_cursor = False
-            self._set_posture(PostureState.STANDING)
-            self.locomotion_action.emit("idle")
-        else:
-            # stand: just stop, hold frame, don't emit — wander timer picks next
-            self._walk_dir = 0
-            self._running = False
-            self._following_cursor = False
-            self._set_posture(PostureState.STANDING)
-        self._schedule_wander()
-
-    def _do_window_interaction(self, w_rect, w_pid, corner):
-        """Pick and start a window interaction based on restlessness."""
-        rest = self._restlessness
-        roll = random.random()
-        if rest >= 4 and roll < 0.25:
-            self.start_window_throw(w_rect, w_pid, corner)
-        elif rest >= 3 and roll < 0.50:
-            self.start_window_push(w_rect, w_pid, corner)
-        elif roll < 0.60:
-            self.start_window_peek(w_rect, w_pid, corner)
-        else:
-            self.start_window_push(w_rect, w_pid, corner)
-
-    def _try_cursor_follow(self) -> bool:
-        """Try to walk/jump toward cursor. Returns True if following."""
-        try:
-            cursor = QCursor.pos()
-        except Exception:
-            return False
-        pos = self._window.pos()
-        mx = float(pos.x()) + self._window.width() / 2
-        my = float(pos.y()) + self._window.height() / 2
-        cx, cy = float(cursor.x()), float(cursor.y())
-        dx = cx - mx
-        dy = cy - my
-        dist = (dx * dx + dy * dy) ** 0.5
-
-        if dist < 30:
-            return False  # already at cursor
-
-        # jump if close enough and lucky
-        if dist < CURSOR_JUMP_DISTANCE and random.random() < CURSOR_JUMP_CHANCE:
-            self.jump_toward(cx, cy)
-            self._following_cursor = True
-            return True
-
-        # walk toward cursor
-        self._walk_dir = 1 if dx > 0 else -1
-        self._still_ticks = 0
-        self._running = self._restlessness >= 3
-        self._following_cursor = True
-        self._set_posture(PostureState.WALKING)
-        self._set_facing("right" if dx > 0 else "left")
-        self.locomotion_action.emit("run" if self._running else "walk")
-        return True
-
     def _screen_rect(self) -> QRect:
-        # use whichever screen Miku is currently on, not always primary
         pos = self._window.pos()
         center = QPoint(
             pos.x() + self._window.width() // 2,

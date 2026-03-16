@@ -898,6 +898,32 @@ class AnimatorWindow(QMainWindow):
         self._variant_combo.currentIndexChanged.connect(self._on_variant_changed)
         variant_row.addWidget(self._variant_label)
         variant_row.addWidget(self._variant_combo, 1)
+
+        # add/remove A/B variant buttons
+        variant_btn_style = f"""
+            QToolButton {{
+                background: {C_SURFACE}; border: 1px solid {C_BORDER};
+                color: {C_TEXT}; font-size: 14px; font-weight: bold;
+                min-width: 24px; min-height: 24px; border-radius: 4px;
+            }}
+            QToolButton:hover {{ background: {C_ACCENT_DIM}; border-color: {C_ACCENT}; }}
+            QToolButton:disabled {{ color: {C_TEXT_MUTED}; }}
+        """
+        self._add_variant_btn = QToolButton()
+        self._add_variant_btn.setText("+")
+        self._add_variant_btn.setToolTip("Add A/B variant (random alternate animation)")
+        self._add_variant_btn.setStyleSheet(variant_btn_style)
+        self._add_variant_btn.clicked.connect(self._add_variant)
+        variant_row.addWidget(self._add_variant_btn)
+
+        self._remove_variant_btn = QToolButton()
+        self._remove_variant_btn.setText("\u2212")  # minus sign
+        self._remove_variant_btn.setToolTip("Remove selected A/B variant")
+        self._remove_variant_btn.setStyleSheet(variant_btn_style)
+        self._remove_variant_btn.setEnabled(False)
+        self._remove_variant_btn.clicked.connect(self._remove_variant)
+        variant_row.addWidget(self._remove_variant_btn)
+
         left_layout.addLayout(variant_row)
 
         # controls: fps, loop, next_action
@@ -941,6 +967,22 @@ class AnimatorWindow(QMainWindow):
         self._min_rest_spin.valueChanged.connect(self._on_controls_changed)
         ctrl_grid.addWidget(self._min_rest_label, 4, 0)
         ctrl_grid.addWidget(self._min_rest_spin, 4, 1)
+
+        # walk_speed (sprite moves while animating, e.g. crawl)
+        self._walk_speed_label = QLabel("Walk speed:")
+        self._walk_speed_spin = QSpinBox()
+        self._walk_speed_spin.setRange(0, 10)
+        self._walk_speed_spin.setValue(0)
+        self._walk_speed_spin.setToolTip("Movement speed during animation (px/tick, 0 = stationary)")
+        self._walk_speed_spin.valueChanged.connect(self._on_controls_changed)
+        ctrl_grid.addWidget(self._walk_speed_label, 5, 0)
+        ctrl_grid.addWidget(self._walk_speed_spin, 5, 1)
+
+        # idle_tier (joins the idle pool)
+        self._idle_tier_check = QCheckBox("Idle tier")
+        self._idle_tier_check.setToolTip("Include in idle pool (alongside sit_idle, idle1-5)")
+        self._idle_tier_check.stateChanged.connect(self._on_controls_changed)
+        ctrl_grid.addWidget(self._idle_tier_check, 6, 0, 1, 2)
 
         left_layout.addLayout(ctrl_grid)
 
@@ -1142,9 +1184,13 @@ class AnimatorWindow(QMainWindow):
             keys.append(f"postures/{p}")
         for c in ACTION_CONTEXTS.get(action_name, []):
             keys.append(f"contexts/{c}")
+        # A/B variants
+        base = self._action_defs.get(action_name)
+        if base:
+            for i in range(len(base.variants)):
+                keys.append(f"variants/{i}")
         # previous variants: show any that already have frames defined,
         # plus all canonical actions as options
-        existing_prev = set(self._action_defs[action_name].previous.keys())
         for a in ACTIONS:
             if a != action_name:
                 keys.append(f"previous/{a}")
@@ -1156,6 +1202,8 @@ class AnimatorWindow(QMainWindow):
         kind, name = key.split("/", 1)
         if kind == "previous":
             return f"from: {name}"
+        if kind == "variants":
+            return f"variant {chr(65 + int(name))}"  # A, B, C...
         return f"{kind[:-1]}: {name}"
 
     def _update_variant_selector(self, action_name: str):
@@ -1187,6 +1235,11 @@ class AnimatorWindow(QMainWindow):
             return base.contexts.get(name, ActionDef(files=[], fps=8, loop=True))
         if kind == "previous":
             return base.previous.get(name, ActionDef(files=[], fps=8, loop=True))
+        if kind == "variants":
+            idx = int(name)
+            if 0 <= idx < len(base.variants):
+                return base.variants[idx]
+            return ActionDef(files=[], fps=8, loop=True)
         return base
 
     # ── interactions ─────────────────────────────────────────────────────────
@@ -1261,13 +1314,14 @@ class AnimatorWindow(QMainWindow):
             for a in ACTIONS
         }
         for name, adef_raw in data.get("actions", {}).items():
-            if name in self._action_defs:
-                self._action_defs[name] = _parse_action_def(adef_raw)
+            self._action_defs[name] = _parse_action_def(adef_raw)
 
         physics_data = data.get("physics", {})
         self._window_pull_spin.setValue(physics_data.get("window_pull_distance", 0))
         self._facing_combo.setCurrentText(physics_data.get("default_facing", "left"))
 
+        # rebuild action list to include custom actions from config
+        self._rebuild_action_list()
         self._current_variant = "base"
         self._load_action_into_ui(self._current_action)
         self._refresh_action_list()
@@ -1277,6 +1331,9 @@ class AnimatorWindow(QMainWindow):
             return
         action_name = action_name.split("  ")[0].strip()  # strip indicators
         self._save_current_to_defs()
+        # ensure action exists in defs (custom actions from config)
+        if action_name not in self._action_defs:
+            self._action_defs[action_name] = ActionDef(files=[], fps=8, loop=True)
         self._current_action = action_name
         self._current_variant = "base"
         self._load_action_into_ui(action_name)
@@ -1286,17 +1343,59 @@ class AnimatorWindow(QMainWindow):
             return
         self._save_current_to_defs()
         self._current_variant = self._variant_combo.itemData(index)
+        # enable remove button only for A/B variants
+        is_ab = self._current_variant.startswith("variants/")
+        self._remove_variant_btn.setEnabled(is_ab)
         self._populate_controls_from_variant()
         self._update_preview()
+
+    def _add_variant(self):
+        """Add a new empty A/B variant to the current action."""
+        self._save_current_to_defs()
+        base = self._action_defs[self._current_action]
+        base.variants.append(ActionDef(files=[], fps=base.fps, loop=base.loop))
+        new_key = f"variants/{len(base.variants) - 1}"
+        self._current_variant = new_key
+        self._update_variant_selector(self._current_action)
+        # select the new variant
+        for i in range(self._variant_combo.count()):
+            if self._variant_combo.itemData(i) == new_key:
+                self._variant_combo.setCurrentIndex(i)
+                break
+        self._remove_variant_btn.setEnabled(True)
+        self._refresh_action_list()
+
+    def _remove_variant(self):
+        """Remove the currently selected A/B variant."""
+        if not self._current_variant.startswith("variants/"):
+            return
+        idx = int(self._current_variant.split("/", 1)[1])
+        base = self._action_defs[self._current_action]
+        if 0 <= idx < len(base.variants):
+            base.variants.pop(idx)
+        self._current_variant = "base"
+        self._remove_variant_btn.setEnabled(False)
+        self._update_variant_selector(self._current_action)
+        self._populate_controls_from_variant()
+        self._update_preview()
+        self._refresh_action_list()
 
     def _load_action_into_ui(self, action_name: str):
         desc = ACTION_DESCRIPTIONS.get(action_name, "")
         self._action_desc.setText(f"{action_name} \u2014 {desc}")
         self._update_variant_selector(action_name)
-        # show min_restlessness only for idle tier actions
-        is_idle_tier = action_name.startswith("idle") and action_name[4:].isdigit()
-        self._min_rest_label.setVisible(is_idle_tier)
-        self._min_rest_spin.setVisible(is_idle_tier)
+        # show idle/movement controls for base variant
+        adef = self._action_defs.get(action_name)
+        is_idle_like = (
+            (action_name.startswith("idle") and action_name[4:].isdigit())
+            or (adef and adef.idle_tier)
+            or self._current_variant == "base"  # always show on base so user can toggle
+        )
+        self._min_rest_label.setVisible(is_idle_like)
+        self._min_rest_spin.setVisible(is_idle_like)
+        self._walk_speed_label.setVisible(True)
+        self._walk_speed_spin.setVisible(True)
+        self._idle_tier_check.setVisible(self._current_variant == "base")
         self._populate_controls_from_variant()
         self._update_preview()
 
@@ -1363,6 +1462,16 @@ class AnimatorWindow(QMainWindow):
         self._min_rest_spin.setValue(adef.min_restlessness)
         self._min_rest_spin.blockSignals(False)
 
+        self._walk_speed_spin.blockSignals(True)
+        self._walk_speed_spin.setValue(int(adef.walk_speed))
+        self._walk_speed_spin.blockSignals(False)
+
+        # idle_tier only applies to base variant
+        base = self._action_defs.get(self._current_action)
+        self._idle_tier_check.blockSignals(True)
+        self._idle_tier_check.setChecked(base.idle_tier if base else False)
+        self._idle_tier_check.blockSignals(False)
+
     def _save_current_to_defs(self):
         """Write the current timeline + controls back into the action def."""
         current_frames = self._timeline.get_frames()
@@ -1384,6 +1493,7 @@ class AnimatorWindow(QMainWindow):
             intro_files=adef.intro_files,
             outro_files=adef.outro_files,
             min_restlessness=self._min_rest_spin.value(),
+            walk_speed=float(self._walk_speed_spin.value()),
         )
 
         base = self._action_defs[self._current_action]
@@ -1397,7 +1507,10 @@ class AnimatorWindow(QMainWindow):
                 postures=base.postures,
                 contexts=base.contexts,
                 previous=base.previous,
+                variants=base.variants,
                 min_restlessness=new_def.min_restlessness,
+                walk_speed=new_def.walk_speed,
+                idle_tier=self._idle_tier_check.isChecked(),
             )
         else:
             kind, name = self._current_variant.split("/", 1)
@@ -1407,6 +1520,10 @@ class AnimatorWindow(QMainWindow):
                 base.contexts[name] = new_def
             elif kind == "previous":
                 base.previous[name] = new_def
+            elif kind == "variants":
+                idx = int(name)
+                if 0 <= idx < len(base.variants):
+                    base.variants[idx] = new_def
 
     def _on_timeline_changed(self):
         self._save_current_to_defs()
@@ -1482,6 +1599,27 @@ class AnimatorWindow(QMainWindow):
     def _on_stop(self):
         self._preview.stop()
 
+    def _rebuild_action_list(self):
+        """Rebuild the action list widget to include both canonical and custom actions."""
+        current = self._current_action
+        self._action_list.blockSignals(True)
+        self._action_list.clear()
+        # canonical actions first, then any custom ones from config
+        all_names = list(ACTIONS)
+        for name in self._action_defs:
+            if name not in all_names:
+                all_names.append(name)
+        for a in all_names:
+            item = QListWidgetItem(a)
+            item.setToolTip(ACTION_DESCRIPTIONS.get(a, "custom action"))
+            self._action_list.addItem(item)
+        # restore selection
+        for i in range(self._action_list.count()):
+            if self._action_list.item(i).text().split("  ")[0].strip() == current:
+                self._action_list.setCurrentRow(i)
+                break
+        self._action_list.blockSignals(False)
+
     def _refresh_action_list(self):
         for i in range(self._action_list.count()):
             item = self._action_list.item(i)
@@ -1492,6 +1630,7 @@ class AnimatorWindow(QMainWindow):
                     adef.files
                     or any(v.files for v in adef.postures.values())
                     or any(v.files for v in adef.contexts.values())
+                    or any(v.files for v in adef.variants)
                 )
             )
             item.setText(f"{name}  \u2713" if has_frames else name)
@@ -1543,7 +1682,7 @@ class AnimatorWindow(QMainWindow):
             lines.append(f'img_dir = "{img_subdir}"\n')
         lines.append("\n")
 
-        def _emit_def(adef: ActionDef, section: str) -> None:
+        def _emit_def(adef: ActionDef, section: str, is_base: bool = False) -> None:
             has_any = adef.files or adef.intro_files or adef.outro_files
             if not has_any:
                 return
@@ -1561,20 +1700,25 @@ class AnimatorWindow(QMainWindow):
             lines.append(f"loop = {'true' if adef.loop else 'false'}\n")
             if adef.min_restlessness > 0:
                 lines.append(f"min_restlessness = {adef.min_restlessness}\n")
+            if adef.walk_speed > 0:
+                lines.append(f"walk_speed = {adef.walk_speed}\n")
+            if is_base and adef.idle_tier:
+                lines.append("idle_tier = true\n")
             lines.append("\n")
 
-        for action_name in ACTIONS:
+        for action_name in self._action_defs:
             adef = self._action_defs[action_name]
             base_has = bool(adef.files or adef.intro_files or adef.outro_files)
             var_has = (
                 any(v.files or v.intro_files or v.outro_files for v in adef.postures.values()) or
                 any(v.files or v.intro_files or v.outro_files for v in adef.contexts.values()) or
-                any(v.files or v.intro_files or v.outro_files for v in adef.previous.values())
+                any(v.files or v.intro_files or v.outro_files for v in adef.previous.values()) or
+                any(v.files or v.intro_files or v.outro_files for v in adef.variants)
             )
             if not base_has and not var_has:
                 continue
 
-            _emit_def(adef, f"actions.{action_name}")
+            _emit_def(adef, f"actions.{action_name}", is_base=True)
 
             for posture_name, pdef in adef.postures.items():
                 _emit_def(pdef, f"actions.{action_name}.postures.{posture_name}")
@@ -1585,9 +1729,14 @@ class AnimatorWindow(QMainWindow):
             for prev_name, prev_def in adef.previous.items():
                 _emit_def(prev_def, f"actions.{action_name}.previous.{prev_name}")
 
+            for i, vdef in enumerate(adef.variants):
+                vname = chr(ord('a') + i)  # a, b, c...
+                _emit_def(vdef, f"actions.{action_name}.variants.{vname}")
+
         unconfigured = [
             a for a in ACTIONS
-            if not self._action_defs[a].files
+            if a in self._action_defs
+            and not self._action_defs[a].files
             and not any(v.files for v in self._action_defs[a].postures.values())
         ]
         if unconfigured:

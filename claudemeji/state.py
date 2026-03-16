@@ -17,6 +17,9 @@ ACTIONS = [
     "stand",          # neutral standing pose (true default idle)
     "walk",           # horizontal locomotion (flipped programmatically for direction)
     "run",            # fast walk (restless locomotion variant)
+    "sprint",         # full dash (high restlessness)
+    "crawl",          # deliberate belly crawl movement
+    "trip",           # stumble/pratfall during run (one-shot, attention-seeking)
     "fall",
     "jump",           # impulse-based jump toward a target
     "climb",          # wall climbing (flipped for right wall)
