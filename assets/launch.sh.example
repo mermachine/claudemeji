@@ -1,0 +1,10 @@
+#!/bin/bash
+# ~/.claudemeji/launch.sh - auto-launched by SessionStart hook with session ID
+# copy to ~/.claudemeji/launch.sh and chmod +x it to enable auto-launch
+#
+# $1 = session_id passed from the hook
+
+SESSION_ID="$1"
+
+CLAUDEMEJI_CONFIG="$HOME/.claudemeji/config.toml" \
+  python3 -m claudemeji.main --session "$SESSION_ID" &

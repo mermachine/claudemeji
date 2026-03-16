@@ -1,0 +1,215 @@
+# shimemiku config for claudemeji
+# sprites by canarypop (Hatsune Miku shimeji pack)
+#
+# note: this pack starts at shime2.png — shime1.png does not exist
+# the config.py fallback references shime1, but we override everything here so it's fine
+#
+# sprite reference (for future editing):
+#   shime2/3       standing idle, music+heart bubbles
+#   shime2b/3b     standing, eyes closed, very content headphones
+#   shime4         falling with speed lines
+#   shime5/6       mild annoy / resistant arms
+#   shime7/8       teary-eyed distressed
+#   shime9/10      fully collapsed / limp
+#   shime11        sitting with headphones, winking
+#   shime12/13/14  wall climbing left
+#   shime15/16/17  sitting with leek held up (like a little scroll or stylus)
+#   shime18/19     bounce land frames
+#   shime20/21     inside a cardboard box
+#   shime22        jump! arms and legs spread
+#   shime23/24/25  ceiling crawl upside-down
+#   shime26        sitting, chin on hands, bored
+#   shime27        sitting, thought bubble with mini-miku clone inside
+#   shime28/29     sitting, heart bubble, blushing happy
+#   shime30        sitting, sparkly star eyes
+#   shime31/32/33  edge dangle, holding a little note card, leg swings
+#   shime34/35/36  walking (no leek)
+#   shime34b/35b/36b  walking with leek raised like a conductor's baton
+#   shime37        cheering/dancing with sparkle
+#   shime38        sitting sad/waiting, small miku figure beside her
+#   shime39/40/41  sitting eating a popsicle
+#   shime42-46     folder opening → mini-miku emerges! (spawn animation)
+#   shime47        tumbling spin / trip
+#   shime48        arms crossed, looking away (calm drag)
+#   shime49/50/51  running hard, leaning forward urgently
+#   shime52        wall climb right variant
+#   shime53        ceiling crawl variant
+#   shime54        sitting, neutral sad waiting
+#   shime55        sitting, dark squiggly thought bubble (growing impatient)
+
+[sprite_pack]
+path = "/Users/phosphorus/projects/claudemeji/assets/shimemiku/shimemiku"
+img_dir = "img"
+frame_width = 128
+frame_height = 128
+
+[physics]
+edge_sit_y_offset = 0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MOVEMENT
+# ──────────────────────────────────────────────────────────────────────────────
+
+[actions.sit_idle]
+# headphones on, gentle headbob - mostly neutral with occasional sparkle
+# shime11 x3, then star-eyes flash (shime30), then back
+files = ["shime11.png", "shime11.png", "shime11.png", "shime30.png", "shime11.png"]
+fps = 2
+loop = true
+
+[actions.walk_right]
+# leek raised like a conductor's baton - purposeful little stride
+files = ["shime34b.png", "shime35b.png", "shime36b.png"]
+fps = 8
+loop = true
+
+[actions.walk_left]
+files = ["shime34b.png", "shime35b.png", "shime36b.png"]
+fps = 8
+loop = true
+flip = true
+
+[actions.fall]
+# tumbling with speed lines
+files = ["shime4.png"]
+fps = 4
+loop = true
+
+[actions.climb]
+# scaling the left wall with determined grip
+files = ["shime12.png", "shime13.png", "shime14.png"]
+fps = 8
+loop = true
+
+[actions.climb_right]
+# right wall - mirrored
+files = ["shime12.png", "shime13.png", "shime14.png"]
+fps = 8
+loop = true
+flip = true
+
+[actions.ceiling]
+# upside-down walk, tails trailing past the light fixture
+files = ["shime23.png", "shime24.png", "shime25.png"]
+fps = 6
+loop = true
+
+[actions.ceiling_right]
+# going right along ceiling
+files = ["shime23.png", "shime24.png", "shime25.png"]
+fps = 6
+loop = true
+flip = true
+
+[actions.edge_sit]
+# perched on a window edge, legs dangling, flipping through a little note card
+files = ["shime31.png", "shime32.png", "shime33.png"]
+fps = 3
+loop = true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLAUDE ACTIONS
+# ──────────────────────────────────────────────────────────────────────────────
+
+[actions.think]
+# humming along with a music note bubble — daydreaming between tool calls
+# the heart bubble flickers in occasionally: a little daydream
+files = ["shime2.png", "shime2.png", "shime3.png", "shime2.png"]
+fps = 2
+loop = true
+
+[actions.think.postures.sitting]
+# deep contemplation: thought bubble with mini-miku thinking inside
+# alternates with the neutral-sad waiting face so she doesn't look too cheerful
+files = ["shime27.png", "shime27.png", "shime54.png"]
+fps = 2
+loop = true
+
+[actions.read]
+# sitting with leek held up like a tiny scroll — scanning files and searching
+# the leek goes up, sideways, down: she's really reading it
+files = ["shime15.png", "shime16.png", "shime17.png", "shime15.png"]
+fps = 5
+loop = true
+
+[actions.type]
+# purposeful walking stride — no leek, just getting to the keyboard
+# slower than run: deliberate, crafting each line
+files = ["shime34.png", "shime35.png", "shime36.png"]
+fps = 9
+loop = true
+
+[actions.run]
+# RUNNING. bash is executing and there is no time to waste
+# full lean, urgent, urgent, urgent
+files = ["shime49.png", "shime50.png", "shime51.png"]
+fps = 12
+loop = true
+
+[actions.wait]
+# the tool is taking a while... she's sitting with the sad figure
+# slowly cycling to the dark squiggly thought bubble as patience wears thin
+files = ["shime38.png", "shime38.png", "shime54.png", "shime38.png", "shime55.png", "shime54.png"]
+fps = 2
+loop = true
+
+[actions.react_good]
+# JUMP then cheer then jump again — something good happened!
+files = ["shime22.png", "shime37.png", "shime22.png"]
+fps = 7
+loop = false
+next_action = "sit_idle"
+
+[actions.react_good.postures.sitting]
+# heart bubble + blush — joyful while seated
+files = ["shime28.png", "shime29.png", "shime28.png"]
+fps = 5
+loop = false
+next_action = "sit_idle"
+
+[actions.react_bad]
+# teary → more teary → collapse
+# (brief, so she recovers quickly — errors happen, it's okay)
+files = ["shime7.png", "shime8.png", "shime7.png", "shime9.png"]
+fps = 5
+loop = false
+next_action = "sit_idle"
+
+[actions.drag]
+# calm drag: arms crossed, looking away — utterly unbothered
+files = ["shime48.png"]
+fps = 2
+loop = true
+
+[actions.drag.contexts.run]
+# dragged while bash was running — DISTRESSED, I was doing something!!
+files = ["shime9.png", "shime10.png"]
+fps = 6
+loop = true
+
+[actions.drag.contexts.type]
+# dragged mid-edit — teary, my beautiful code...
+files = ["shime7.png", "shime8.png"]
+fps = 5
+loop = true
+
+[actions.drag.contexts.wait]
+# dragged while waiting — mildly resistant, slightly angy
+# (was already frustrated, now this)
+files = ["shime5.png", "shime6.png"]
+fps = 5
+loop = true
+
+[actions.drag.contexts.read]
+# dragged mid-read — surprised and mildly put out
+files = ["shime5.png", "shime6.png"]
+fps = 5
+loop = true
+
+[actions.spawn]
+# a folder! it opens... it opens more... and out comes a mini-miku subagent!
+# plays once then flows into react_good (celebrating the new arrival)
+files = ["shime42.png", "shime43.png", "shime44.png", "shime45.png", "shime46.png"]
+fps = 6
+loop = false
+next_action = "react_good"

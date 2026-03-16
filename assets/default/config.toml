@@ -1,0 +1,95 @@
+# claudemeji config for shimemiku (Hatsune Miku shimeji pack by canarypop)
+# copy to ~/.claudemeji/config.toml to use
+
+[sprite_pack]
+path = "~/projects/claudemeji/assets/shimemiku/shimemiku"
+img_dir = "img"
+
+# --- action definitions ---
+# frame filenames from the pack's img/ directory
+
+[actions.sit_idle]
+# 立つ (standing)
+files = ["shime1.png"]
+fps = 2
+loop = true
+
+[actions.walk_left]
+# 歩く (walking, original direction is left)
+files = ["shime1b.png", "shime2b.png", "shime1b.png", "shime3b.png"]
+fps = 8
+loop = true
+
+[actions.walk_right]
+# walk_left frames mirrored
+files = ["shime1b.png", "shime2b.png", "shime1b.png", "shime3b.png"]
+fps = 8
+loop = true
+flip = true
+
+[actions.fall]
+# 落ちる (falling)
+files = ["shime4.png"]
+fps = 2
+loop = true
+
+[actions.climb]
+# 壁を登る (wall climbing)
+files = ["shime14.png", "shime52.png", "shime13.png", "shime52.png"]
+fps = 6
+loop = true
+
+[actions.think]
+# 座る (sitting with fidget blinks) - deep in thought
+files = ["shime11.png", "shime11.png", "shime11.png", "shime11.png",
+         "shime15.png", "shime16.png", "shime17.png", "shime16.png", "shime17.png",
+         "shime16.png", "shime11.png"]
+fps = 6
+loop = true
+
+[actions.read]
+# 座って見上げる (sitting, looking up attentively)
+files = ["shime26.png"]
+fps = 2
+loop = true
+
+[actions.type]
+# 走る (running - repurposed for active editing energy)
+files = ["shime49.png", "shime50.png", "shime51.png"]
+fps = 12
+loop = true
+
+[actions.run]
+# ジャンプ→走る (jump pose + run - for bash execution)
+files = ["shime22.png", "shime49.png", "shime50.png", "shime51.png",
+         "shime50.png", "shime49.png", "shime22.png"]
+fps = 10
+loop = true
+
+[actions.wait]
+# 足をぶらぶらさせる (sitting with dangling feet - nervous waiting)
+files = ["shime31.png", "shime32.png", "shime31.png", "shime33.png"]
+fps = 3
+loop = true
+
+[actions.react_good]
+# 跳ねる (bouncing - success!)
+files = ["shime22.png", "shime18.png", "shime19.png", "shime18.png",
+         "shime19.png", "shime1.png"]
+fps = 10
+loop = false
+next_action = "sit_idle"
+
+[actions.react_bad]
+# 転ぶ (tripping and falling over - oops)
+files = ["shime19.png", "shime18.png", "shime47.png", "shime47.png",
+         "shime19.png", "shime1.png"]
+fps = 8
+loop = false
+next_action = "sit_idle"
+
+[actions.drag]
+# つままれる neutral pose (being held)
+files = ["shime48.png"]
+fps = 2
+loop = true
