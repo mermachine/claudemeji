@@ -39,15 +39,24 @@ FORCE_ACTIONS = {"drag", "fall", "react_bad"}
 
 # --- threaded AX helper ---
 
+_ax_skip_count = 0
+
 def _ax_threaded(fn, *args):
     """Run an AX API call on a daemon thread (avoids blocking the UI)."""
+    global _ax_skip_count
     if not _wrangler.is_trusted():
+        _ax_skip_count += 1
+        if _ax_skip_count <= 3 or _ax_skip_count % 50 == 0:
+            print(f"[claudemeji] AX call skipped — no Accessibility permission ({_ax_skip_count} total skips)")
         return
+    _ax_skip_count = 0
     def _safe():
         try:
-            fn(*args)
+            result = fn(*args)
+            if fn.__name__ != "move_window_by":  # don't spam for per-tick moves
+                print(f"[claudemeji] AX {fn.__name__} → {result}")
         except Exception as e:
-            print(f"[claudemeji] AX error: {e}")
+            print(f"[claudemeji] AX error in {fn.__name__}: {e}")
     threading.Thread(target=_safe, daemon=True).start()
 
 
@@ -301,6 +310,19 @@ def main():
         _ax_threaded(_wrangler.throw_and_minimize, pid, rect, physics._screen_rect(), direction)
 
     physics.window_throw.connect(on_window_throw)
+
+    # --- accessibility check ---
+
+    if _wrangler.is_available():
+        if _wrangler.is_trusted():
+            print("[claudemeji] Accessibility permission: GRANTED ✓")
+        else:
+            print("[claudemeji] ⚠ Accessibility permission NOT granted!")
+            print("[claudemeji]   Window interactions (push, throw, wiggle) will be disabled.")
+            print("[claudemeji]   Grant in: System Settings > Privacy & Security > Accessibility")
+            _wrangler.request_trust()
+    else:
+        print("[claudemeji] Accessibility API not available (pyobjc-framework-ApplicationServices missing)")
 
     # --- restlessness ---
 

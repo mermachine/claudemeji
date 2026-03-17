@@ -117,13 +117,12 @@ def _ax_set_position(element: Any, x: float, y: float) -> bool:
         return False
 
 
-def _find_ax_window(pid: int, rect: QRect, tolerance: int = 20) -> Any | None:
+def _find_ax_window(pid: int, rect: QRect | None = None, tolerance: int = 40) -> Any | None:
     """
-    Find the AX window element for a given pid whose on-screen position
-    approximately matches rect.  Returns the element or None.
+    Find the AX window element for a given pid.
 
-    We match by position rather than title because window titles are
-    often not available from Quartz without extra entitlements.
+    If rect is provided, tries to match by position (with tolerance).
+    Falls back to the first AX window for that pid if position matching fails.
     """
     if not _AX_AVAILABLE:
         return None
@@ -131,29 +130,47 @@ def _find_ax_window(pid: int, rect: QRect, tolerance: int = 20) -> Any | None:
         app_el = AXUIElementCreateApplication(pid)
         windows, err = _ax_get(app_el, kAXWindowsAttribute)
         if err != 0 or not windows:
+            print(f"[claudemeji] AX: no windows for pid {pid} (err={err})")
             return None
 
+        # filter to real windows (skip menubars, etc.)
+        real_windows = []
         for win in windows:
-            pos_val, err2 = _ax_get(win, kAXPositionAttribute)
-            if err2 != 0 or pos_val is None:
-                continue
-            # pos_val is an AXValue; read it via ctypes
-            try:
-                pt = _CGPoint()
-                ok = _AXLib.AXValueGetValue(
-                    ctypes.c_void_p(id(pos_val)),
-                    _kAXValueCGPointType,
-                    ctypes.byref(pt),
-                )
-                wx, wy = pt.x, pt.y
-            except Exception:
-                continue
+            role, rerr = _ax_get(win, kAXRoleAttribute)
+            if rerr == 0 and role == "AXWindow":
+                real_windows.append(win)
 
-            if (abs(wx - rect.x()) <= tolerance and
-                    abs(wy - rect.y()) <= tolerance):
-                return win
+        if not real_windows:
+            # fall back to all windows if role filtering found nothing
+            real_windows = list(windows)
+
+        # try position matching first
+        if rect is not None:
+            for win in real_windows:
+                pos_val, err2 = _ax_get(win, kAXPositionAttribute)
+                if err2 != 0 or pos_val is None:
+                    continue
+                try:
+                    pt = _CGPoint()
+                    ok = _AXLib.AXValueGetValue(
+                        ctypes.c_void_p(id(pos_val)),
+                        _kAXValueCGPointType,
+                        ctypes.byref(pt),
+                    )
+                    if ok:
+                        wx, wy = pt.x, pt.y
+                        if (abs(wx - rect.x()) <= tolerance and
+                                abs(wy - rect.y()) <= tolerance):
+                            return win
+                except Exception:
+                    continue
+
+        # fallback: just return the first real window for this pid
+        if real_windows:
+            return real_windows[0]
         return None
-    except Exception:
+    except Exception as e:
+        print(f"[claudemeji] AX: error finding window for pid {pid}: {e}")
         return None
 
 

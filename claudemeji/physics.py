@@ -58,14 +58,16 @@ HANG_CHANCE         = 0.35
 HANG_DURATION       = (180, 420)
 
 # jumping
-JUMP_IMPULSE_X      = 6.0
-JUMP_IMPULSE_Y      = -12.0
-JUMP_MIN_HEIGHT     = -8.0
+JUMP_IMPULSE_X      = 8.0
+JUMP_IMPULSE_Y      = -16.0
+JUMP_MIN_HEIGHT     = -10.0
 
 # cursor following (restlessness-gated)
 CURSOR_FOLLOW_CHANCE = {2: 0.15, 3: 0.30, 4: 0.45}
-CURSOR_JUMP_DISTANCE = 250
-CURSOR_JUMP_CHANCE   = 0.35
+CURSOR_CHASE_TICKS   = {2: (90, 180), 3: (120, 250), 4: (180, 400)}
+CURSOR_LUNGE_RANGE_X = 350     # horizontal distance to stop and lunge from (she doesn't need to be right under!)
+CURSOR_LUNGE_BUDGET  = {2: (1, 2), 3: (2, 3), 4: (2, 4)}
+CURSOR_LUNGE_COOLDOWN = 25     # ticks between lunges (land + reorient)
 
 # window pushing/dragging
 WINDOW_PUSH_SPEED     = 1.0
@@ -182,6 +184,21 @@ class PullState:
         self.tick_counter = 0
 
 
+@dataclass
+class CursorChaseState:
+    """Tracks an active cursor chase: sprint → lunge → lunge → give up."""
+    active: bool = False
+    lunges_left: int = 0
+    cooldown: int = 0        # ticks until next lunge allowed (land + reorient)
+    phase: str = "approach"  # "approach" (sprinting toward) or "lunging" (in the air / recovering)
+
+    def reset(self):
+        self.active = False
+        self.lunges_left = 0
+        self.cooldown = 0
+        self.phase = "approach"
+
+
 # --- helpers ---
 
 def _restless_params(level: int) -> tuple:
@@ -203,10 +220,14 @@ def _weighted_choice(options: list[tuple[str, float]]) -> str:
 # --- platform helpers (work on normalized (QRect, pid) lists) ---
 
 def _find_surface_below(platforms, x: float, y_from: float, miku_w: float,
-                        miku_h: float, screen_floor: float) -> float:
-    """Highest surface at x that is at or below y_from."""
+                        miku_h: float, screen_floor: float,
+                        ignore_pid: int = 0) -> float:
+    """Highest surface at x that is at or below y_from.
+    ignore_pid: skip platforms owned by this pid (for drop-through)."""
     best = screen_floor
-    for rect, _pid in platforms:
+    for rect, pid in platforms:
+        if ignore_pid and pid == ignore_pid:
+            continue
         if x + miku_w > rect.left() and x < rect.right():
             surface = float(rect.top()) - miku_h
             if surface >= y_from and surface < best:
@@ -264,6 +285,7 @@ class PhysicsEngine(QObject):
         self._running = False
         self._sprinting = False
         self._following_cursor = False
+        self._chase = CursorChaseState()
         self._action_walk_speed = 0.0
         self._facing = "left"
         self._offset = Vec2()
@@ -282,6 +304,7 @@ class PhysicsEngine(QObject):
         self._push = PushState()
         self._pull = PullState()
         self._peek_ticks = 0
+        self._drop_through_pid: int = 0  # temporarily ignore this platform's pid when falling
 
         # platforms: normalized to list of (QRect, pid)
         self._platforms: list[tuple[QRect, int]] = []
@@ -335,6 +358,7 @@ class PhysicsEngine(QObject):
         self._walk_dir = 0
         self._vel.x = 0
         self._following_cursor = False
+        self._chase.reset()
         self._action_walk_speed = 0.0
 
     def unlock(self):
@@ -367,7 +391,8 @@ class PhysicsEngine(QObject):
         self._still_ticks = 0
         self._running = run or sprint
         self._sprinting = sprint
-        self._following_cursor = False
+        # note: _following_cursor is NOT cleared here — chase approach uses _start_walking.
+        # it's cleared by _end_chase, _decide_wander, lock_for_event, etc. instead.
         self._set_posture(PostureState.WALKING)
         self._set_facing("left" if direction < 0 else "right")
         action = "sprint" if sprint else ("run" if run else "walk")
@@ -493,15 +518,48 @@ class PhysicsEngine(QObject):
 
     # --- jumping ---
 
-    def jump_toward(self, target_x: float, target_y: float):
+    def jump_toward(self, target_x: float, target_y: float, desperate: bool = False):
+        """Jump toward a target. desperate=True for bigger, wilder arcs (cursor lunges)."""
         if self._state in (PhysicsState.DRAGGED, PhysicsState.PUSHING_WINDOW):
             return
         pos = self._window.pos()
         x, y = float(pos.x()), float(pos.y())
         dx, dy = target_x - x, target_y - y
+        hdist = abs(dx)
+        vdist = abs(dy)
         dist = max(1.0, (dx * dx + dy * dy) ** 0.5)
-        self._vel.x = (dx / dist) * JUMP_IMPULSE_X
-        self._vel.y = min(JUMP_MIN_HEIGHT, (dy / dist) * JUMP_IMPULSE_Y)
+
+        # scale impulse with distance — further = bigger jump
+        dist_scale = min(1.5, max(0.6, dist / 300.0))
+        # add randomness: ±25% variation so each jump feels different
+        jitter = 0.75 + random.random() * 0.5  # 0.75–1.25
+
+        if desperate:
+            dist_scale *= 1.2
+            jitter = 0.75 + random.random() * 0.5
+
+        # horizontal: aim toward target
+        dir_x = 1.0 if dx > 0 else -1.0 if dx < 0 else 0.0
+        ix = dir_x * JUMP_IMPULSE_X * min(2.0, max(0.4, hdist / 150.0)) * jitter
+
+        # vertical: depends on whether target is above or below
+        if dy > 0:
+            # target is BELOW — dive! hop outward and let gravity do the work
+            # enough upward to clear window edges, strong horizontal to get out there
+            iy = -8.0 * jitter
+            ix *= 1.5  # extra horizontal so she clears the platform edge
+        else:
+            # target is above — jump UP
+            vert_scale = dist_scale
+            if desperate:
+                vert_scale *= min(1.3, max(1.0, vdist / 400.0))
+            iy = JUMP_IMPULSE_Y * vert_scale * jitter
+
+        # clamp: good air but not orbital
+        iy = max(-30.0, min(iy, -6.0 if desperate else -5.0))
+
+        self._vel.x = ix
+        self._vel.y = iy
         self._pull.reset()
         self._climb.hanging = False
         self._climb.window = None
@@ -598,11 +656,13 @@ class PhysicsEngine(QObject):
         x += self._vel.x
         y += self._vel.y
 
-        # land on surface
-        target_floor = _find_surface_below(self._platforms, x, old_y, miku_w, miku_h, screen_floor)
+        # land on surface (ignore drop-through platform)
+        target_floor = _find_surface_below(self._platforms, x, old_y, miku_w, miku_h,
+                                           screen_floor, ignore_pid=self._drop_through_pid)
         if y >= target_floor:
             y = target_floor
             self._vel = Vec2()
+            self._drop_through_pid = 0  # clear on landing
             self._land(target_floor)
         elif y <= ceil_y:
             y = ceil_y
@@ -625,6 +685,7 @@ class PhysicsEngine(QObject):
         if y > screen_floor:
             y = screen_floor
             self._vel = Vec2()
+            self._drop_through_pid = 0
             self._land(screen_floor)
 
         # wall grab on screen edges — thrown sprites grab much more reliably
@@ -656,8 +717,14 @@ class PhysicsEngine(QObject):
             self._vel.x = 0.0
 
         if not self._event_locked:
+            # active cursor chase: keep steering / lunging
+            if self._following_cursor and self._chase.active:
+                self._tick_cursor_chase()
+
             self._wander_ticks -= 1
             if self._wander_ticks <= 0:
+                self._following_cursor = False
+                self._chase.reset()
                 self._decide_wander()
 
             if self._action_walk_speed > 0:
@@ -673,6 +740,8 @@ class PhysicsEngine(QObject):
             # wall collisions
             x, climbed = self._handle_ground_walls(x, left_x, right_x)
             if climbed:
+                self._following_cursor = False
+                self._chase.reset()
                 return x, y
 
             # windows are below her z-level — she walks freely in front of them.
@@ -689,13 +758,57 @@ class PhysicsEngine(QObject):
         # window pull (sprite weight)
         y = self._tick_window_pull(y)
 
+        # unstick: if on a window (not screen floor) and restless, sometimes jump off
+        on_window = abs(self._floor_y - screen_floor) > SURFACE_TOLERANCE
+        standing_platform = (_find_platform_at(self._platforms, x, self._floor_y,
+                                               miku_w, miku_h, screen_floor)
+                             if on_window else None)
+        if (on_window and not self._event_locked and self._restlessness >= 1
+                and self._walk_dir == 0 and self._still_ticks > 60):
+            # chance per tick to get bored and jump off (scales with restlessness)
+            bail_chance = {1: 0.003, 2: 0.008, 3: 0.015, 4: 0.025}.get(self._restlessness, 0)
+            if random.random() < bail_chance:
+                self._pull.reset()
+                # mark this platform as drop-through so she falls past it
+                if standing_platform:
+                    self._drop_through_pid = standing_platform[1]
+                # if chasing cursor and it's below, dive toward it
+                if self._following_cursor and self._chase.active:
+                    try:
+                        cursor = QCursor.pos()
+                        cx, cy = float(cursor.x()), float(cursor.y())
+                        if cy > y:  # cursor is below
+                            print(f"[claudemeji] DIVE off window toward cursor!")
+                            self.jump_toward(cx, cy, desperate=True)
+                            return x, y
+                    except Exception:
+                        pass
+                # otherwise just hop off in a random direction
+                direction = random.choice([-1, 1])
+                self._vel.x = direction * JUMP_IMPULSE_X * 0.5
+                self._vel.y = JUMP_IMPULSE_Y * 0.2  # tiny hop
+                self._state = PhysicsState.FALLING
+                self._set_posture(PostureState.FALLING)
+                self.locomotion_action.emit("jump")
+                print(f"[claudemeji] bored on window, hopping off")
+                return x, y
+
         # edge detection: walked off surface?
         if not _surface_at(self._platforms, x, self._floor_y, miku_w, miku_h, screen_floor):
             self._pull.reset()
-            # deliberate edge leap: sometimes jump off instead of just falling
-            if (self._walk_dir != 0
+            if self._following_cursor:
+                # chasing cursor off an edge — leap toward it!
+                try:
+                    cursor = QCursor.pos()
+                    cx, cy = float(cursor.x()), float(cursor.y())
+                    self.jump_toward(cx, cy, desperate=True)
+                    print("[claudemeji] cursor chase: EDGE LEAP toward cursor")
+                except Exception:
+                    self._start_falling()
+            elif (self._walk_dir != 0
                     and not self._event_locked
                     and random.random() < EDGE_LEAP_CHANCE):
+                # deliberate edge leap: sometimes jump off instead of just falling
                 self._vel.x = self._walk_dir * EDGE_LEAP_IMPULSE_X
                 self._vel.y = EDGE_LEAP_IMPULSE_Y
                 self._state = PhysicsState.FALLING
@@ -886,6 +999,9 @@ class PhysicsEngine(QObject):
             if self._try_special_behavior(rest):
                 self._schedule_wander()
                 return
+            # log failures occasionally (not every tick)
+            if not self._platforms and random.random() < 0.05:
+                print(f"[claudemeji] wander: no platforms detected (window interactions unavailable)")
 
         # trip check: if currently running/sprinting, small chance to stumble
         if (self._running or self._sprinting) and rest >= 2:
@@ -949,34 +1065,49 @@ class PhysicsEngine(QObject):
         self._schedule_wander()
 
     def _try_special_behavior(self, rest: int) -> bool:
-        """Roll for cursor-follow, nearby window, or window-seek. Returns True if triggered."""
-        roll = random.random()
+        """Try cursor-follow, nearby window, or window-seek. Falls through on failure."""
+        # build a shuffled list of behaviors to try (weighted by restlessness)
+        behaviors: list[tuple[str, float]] = []
         cursor_chance = CURSOR_FOLLOW_CHANCE.get(rest, 0)
-        window_near_chance = 0.15 if rest >= 2 else 0
-        window_seek_chance = WINDOW_SEEK_CHANCE.get(rest, 0)
+        if cursor_chance > 0:
+            behaviors.append(("cursor", cursor_chance))
+        if rest >= 2:
+            behaviors.append(("window_near", 0.15))
+        window_seek = WINDOW_SEEK_CHANCE.get(rest, 0)
+        if window_seek > 0:
+            behaviors.append(("window_seek", window_seek))
 
-        # cumulative thresholds
-        t_cursor = cursor_chance
-        t_near = t_cursor + window_near_chance
-        t_seek = t_near + window_seek_chance
+        if not behaviors:
+            return False
 
-        if roll < t_cursor:
-            if self._try_cursor_follow():
+        # pick one weighted, but if it fails, try the others
+        order = []
+        remaining = list(behaviors)
+        while remaining:
+            pick = _weighted_choice(remaining)
+            order.append(pick)
+            remaining = [(n, w) for n, w in remaining if n != pick]
+
+        for behavior in order:
+            if behavior == "cursor" and self._try_cursor_follow():
+                print(f"[claudemeji] special: cursor follow (rest={rest})")
                 return True
-        elif roll < t_near:
-            nearby = self._nearby_window()
-            if nearby:
-                corner, w_rect, w_pid = nearby
-                self._do_window_interaction(w_rect, w_pid, corner)
-                return True
-        elif roll < t_seek:
-            target = self._pick_random_window()
-            if target:
-                corner, w_rect, w_pid = target
-                target_x = float(w_rect.left() if corner == "left" else w_rect.right())
-                target_y = float(w_rect.top()) - self._window.height()
-                self.jump_toward(target_x, target_y)
-                return True
+            elif behavior == "window_near":
+                nearby = self._nearby_window()
+                if nearby:
+                    corner, w_rect, w_pid = nearby
+                    print(f"[claudemeji] special: window interact near corner={corner} (rest={rest})")
+                    self._do_window_interaction(w_rect, w_pid, corner)
+                    return True
+            elif behavior == "window_seek":
+                target = self._pick_random_window()
+                if target:
+                    corner, w_rect, w_pid = target
+                    target_x = float(w_rect.left() if corner == "left" else w_rect.right())
+                    target_y = float(w_rect.top()) - self._window.height()
+                    print(f"[claudemeji] special: jump to window corner={corner} (rest={rest})")
+                    self.jump_toward(target_x, target_y)
+                    return True
 
         return False
 
@@ -984,15 +1115,21 @@ class PhysicsEngine(QObject):
         rest = self._restlessness
         roll = random.random()
         if rest >= 4 and roll < 0.25:
+            print(f"[claudemeji] window interaction: THROW (pid={w_pid}, corner={corner})")
             self.start_window_throw(w_rect, w_pid, corner)
         elif rest >= 3 and roll < 0.50:
+            print(f"[claudemeji] window interaction: PUSH (pid={w_pid}, corner={corner})")
             self.start_window_push(w_rect, w_pid, corner)
         elif roll < 0.60:
+            print(f"[claudemeji] window interaction: PEEK (pid={w_pid}, corner={corner})")
             self.start_window_peek(w_rect, w_pid, corner)
         else:
+            print(f"[claudemeji] window interaction: PUSH (pid={w_pid}, corner={corner})")
             self.start_window_push(w_rect, w_pid, corner)
 
     def _try_cursor_follow(self) -> bool:
+        """Start a cursor chase: sprint toward cursor, then lunge at it a few times."""
+        rest = self._restlessness
         try:
             cursor = QCursor.pos()
         except Exception:
@@ -1001,19 +1138,33 @@ class PhysicsEngine(QObject):
         mx = float(pos.x()) + self._window.width() / 2
         my = float(pos.y()) + self._window.height() / 2
         cx, cy = float(cursor.x()), float(cursor.y())
-        dx, dy = cx - mx, cy - my
-        dist = (dx * dx + dy * dy) ** 0.5
+        dx = cx - mx
+        dist = ((cx - mx) ** 2 + (cy - my) ** 2) ** 0.5
 
         if dist < 30:
             return False
 
-        if dist < CURSOR_JUMP_DISTANCE and random.random() < CURSOR_JUMP_CHANCE:
-            self.jump_toward(cx, cy)
-            self._following_cursor = True
-            return True
-
-        self._start_walking(1 if dx > 0 else -1, run=self._restlessness >= 3)
+        # set up the chase state
+        budget_range = CURSOR_LUNGE_BUDGET.get(rest, (1, 2))
+        self._chase = CursorChaseState(
+            active=True,
+            lunges_left=random.randint(*budget_range),
+            cooldown=0,
+            phase="approach",
+        )
         self._following_cursor = True
+
+        # start sprinting toward cursor
+        sprint = rest >= 3
+        direction = 1 if dx > 0 else -1
+        self._start_walking(direction, run=True, sprint=sprint)
+
+        # commit to the chase
+        chase_range = CURSOR_CHASE_TICKS.get(rest, (90, 180))
+        self._wander_ticks = random.randint(*chase_range)
+
+        print(f"[claudemeji] cursor chase: BEGIN ({'sprint' if sprint else 'run'}, "
+              f"dist={dist:.0f}, {self._chase.lunges_left} lunges, rest={rest})")
         return True
 
     # --- surface/window queries ---
@@ -1060,38 +1211,144 @@ class PhysicsEngine(QObject):
                 return True
         return False
 
-    def _nearby_window(self, max_dist: float = 100.0):
-        """Find a window near miku for interaction. Returns (corner, QRect, pid) or None."""
+    def _tick_cursor_chase(self):
+        """Cursor chase tick: approach → lunge → recover → lunge → give up."""
+        chase = self._chase
+        if not chase.active:
+            self._following_cursor = False
+            return
+
+        try:
+            cursor = QCursor.pos()
+        except Exception:
+            self._end_chase()
+            return
+
+        pos = self._window.pos()
+        mx = float(pos.x()) + self._window.width() / 2
+        my = float(pos.y()) + self._window.height() / 2
+        cx, cy = float(cursor.x()), float(cursor.y())
+        dx = cx - mx
+        hdist = abs(dx)  # horizontal distance — this is what matters for lunging
+
+        # out of lunges → done
+        if chase.lunges_left <= 0:
+            print(f"[claudemeji] cursor chase: out of lunges, giving up")
+            self._end_chase()
+            return
+
+        # cooldown between lunges (recovering after landing)
+        if chase.cooldown > 0:
+            chase.cooldown -= 1
+            return
+
+        if chase.phase == "approach":
+            # cursor is below us? DIVE — drop through this platform toward it
+            if cy > my + 50 and hdist < CURSOR_LUNGE_RANGE_X:
+                chase.phase = "lunging"
+                chase.lunges_left -= 1
+                self._walk_dir = 0
+                self._set_facing("left" if dx < 0 else "right")
+                # find what we're standing on and ignore it during the fall
+                miku_w = float(self._window.width())
+                miku_h = float(self._window.height())
+                screen_floor = float(self._screen_rect().bottom() - miku_h)
+                plat = _find_platform_at(self._platforms, float(self._window.pos().x()),
+                                         self._floor_y, miku_w, miku_h, screen_floor)
+                if plat:
+                    self._drop_through_pid = plat[1]
+                print(f"[claudemeji] cursor chase: DIVE DOWN! (hdist={hdist:.0f}, "
+                      f"below by {cy - my:.0f}px, {chase.lunges_left} left)")
+                self.jump_toward(cx, cy, desperate=True)
+                chase.cooldown = CURSOR_LUNGE_COOLDOWN
+                return
+
+            if hdist > CURSOR_LUNGE_RANGE_X:
+                # far away: steer toward cursor (with dead zone to prevent flip-flop)
+                if hdist > 80:
+                    desired_dir = 1 if dx > 0 else -1
+                    if desired_dir != self._walk_dir:
+                        self._walk_dir = desired_dir
+                        self._set_facing("left" if desired_dir < 0 else "right")
+            else:
+                # within lunge range — stop, face cursor, LUNGE!
+                chase.phase = "lunging"
+                chase.lunges_left -= 1
+                self._walk_dir = 0
+                self._set_facing("left" if dx < 0 else "right")
+                print(f"[claudemeji] cursor chase: LUNGE! (hdist={hdist:.0f}, "
+                      f"{chase.lunges_left} left)")
+                self.jump_toward(cx, cy, desperate=True)
+                chase.cooldown = CURSOR_LUNGE_COOLDOWN
+                return
+
+        elif chase.phase == "lunging":
+            # in the air or just landed — wait for grounded
+            if self._state == PhysicsState.GROUNDED:
+                if chase.lunges_left > 0:
+                    chase.phase = "approach"
+                    # reposition: run to offset from cursor, not directly under
+                    # pick a side to approach from (biased toward current facing)
+                    offset = random.choice([-1, 1]) * random.randint(100, 300)
+                    reposition_dir = 1 if (cx + offset) > mx else -1
+                    sprint = self._restlessness >= 3
+                    self._start_walking(reposition_dir, run=True, sprint=sprint)
+                    chase.cooldown = CURSOR_LUNGE_COOLDOWN
+                    print(f"[claudemeji] cursor chase: landed, repositioning "
+                          f"({chase.lunges_left} lunges left)")
+                else:
+                    print(f"[claudemeji] cursor chase: last lunge done, giving up")
+                    self._end_chase()
+
+    def _end_chase(self):
+        """End the cursor chase cleanly."""
+        self._chase.reset()
+        self._following_cursor = False
+        # she failed to catch it — brief pause before doing something else
+        self._walk_dir = 0
+        self._set_posture(PostureState.STANDING)
+        self.locomotion_action.emit("stand")
+        self._schedule_wander()
+
+    def _nearby_window(self, max_dist: float = 200.0):
+        """Find a window near miku for interaction. Returns (corner, QRect, pid) or None.
+        Checks proximity to any edge of the window, not just corners."""
         miku_w = float(self._window.width())
         miku_h = float(self._window.height())
         pos = self._window.pos()
         mx, my = float(pos.x()), float(pos.y())
-        miku_bottom = my + miku_h
+        miku_cx = mx + miku_w / 2
+        miku_cy = my + miku_h / 2
+
+        best = None
+        best_dist = max_dist
 
         for rect, pid in self._platforms:
-            if abs(rect.top() - miku_bottom) > max_dist:
-                continue
-            if abs(mx - rect.left()) < max_dist:
-                return ("left", rect, pid)
-            if abs((mx + miku_w) - rect.right()) < max_dist:
-                return ("right", rect, pid)
-        return None
+            # closest point on window rect to miku center
+            cx = max(float(rect.left()), min(miku_cx, float(rect.right())))
+            cy = max(float(rect.top()), min(miku_cy, float(rect.bottom())))
+            dist = ((miku_cx - cx) ** 2 + (miku_cy - cy) ** 2) ** 0.5
+            if dist < best_dist:
+                # pick corner: which side is miku on?
+                corner = "left" if miku_cx < float(rect.left() + rect.right()) / 2 else "right"
+                best = (corner, rect, pid)
+                best_dist = dist
+
+        return best
 
     def _pick_random_window(self):
         """Pick a random window to walk/jump toward. Returns (corner, QRect, pid) or None."""
         if not self._platforms:
             return None
-        miku_h = float(self._window.height())
-        miku_bottom = float(self._window.pos().y()) + miku_h
         mx = float(self._window.pos().x())
 
+        # any on-screen window is fair game
         candidates = []
         for rect, pid in self._platforms:
-            if abs(rect.top() - miku_bottom) < 200:
-                left_dist = abs(mx - rect.left())
-                right_dist = abs(mx - rect.right())
-                corner = "left" if left_dist < right_dist else "right"
-                candidates.append((corner, rect, pid))
+            left_dist = abs(mx - rect.left())
+            right_dist = abs(mx - rect.right())
+            corner = "left" if left_dist < right_dist else "right"
+            candidates.append((corner, rect, pid))
 
         return random.choice(candidates) if candidates else None
 
