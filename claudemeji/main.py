@@ -25,8 +25,8 @@ from claudemeji.sprite import SpritePlayer
 from claudemeji.physics import PhysicsEngine
 from claudemeji.state import StateMachine
 from claudemeji.watcher import HookWatcher
-from claudemeji.platform_utils import apply_macos_window_fixes
-from claudemeji.windows import get_window_infos, is_available as windows_available
+from claudemeji.platform_utils import apply_macos_window_fixes, set_window_floating, set_window_above
+from claudemeji.windows import get_window_infos, get_platform_tuples, is_available as windows_available
 from claudemeji.restlessness import RestlessnessEngine
 import claudemeji.window_wrangler as _wrangler
 
@@ -130,67 +130,144 @@ def _resolve_drag_context(config: Config | None, restlessness: int,
 
 # --- debug panel ---
 
+# keep a reference so the non-modal dialog doesn't get garbage collected
+_debug_dialog = None
+
+
 def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
                       restless: RestlessnessEngine, play_fn, posture_ref: list):
-    """Pop up the debug/tuning dialog."""
-    from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
-                                 QSlider, QLabel, QPushButton, QComboBox)
+    """Non-modal debug panel with live state, controls, and targeted actions."""
+    global _debug_dialog
+    if _debug_dialog is not None:
+        _debug_dialog.raise_()
+        _debug_dialog.activateWindow()
+        return
+
+    from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
+                                 QSlider, QLabel, QPushButton, QComboBox,
+                                 QGroupBox, QRadioButton, QButtonGroup,
+                                 QFrame, QScrollArea, QWidget)
     from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QFont
+    from claudemeji.physics import _plat_rect, _plat_pid, _plat_zidx
+
+    mono = QFont("Menlo, Monaco, Courier New")
+    mono.setPointSize(11)
 
     dialog = QDialog()
     dialog.setWindowTitle("claudemeji debug")
-    dialog.setFixedWidth(320)
-    layout = QVBoxLayout()
-    layout.setSpacing(8)
+    dialog.setMinimumWidth(380)
+    dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
 
-    # current state display
-    action_label = QLabel(f"Action: {player.current_action()}  |  Posture: {posture_ref[0]}")
-    action_label.setStyleSheet("font-weight: bold;")
-    layout.addWidget(action_label)
-    refresh = QTimer()
-    refresh.setInterval(250)
-    refresh.timeout.connect(
-        lambda: action_label.setText(
-            f"Action: {player.current_action()}  |  Posture: {posture_ref[0]}"
-            f"  |  Facing: {physics._facing}"
-        )
-    )
-    refresh.start()
+    def on_close():
+        global _debug_dialog
+        _debug_dialog = None
+    dialog.destroyed.connect(on_close)
+
+    main_layout = QVBoxLayout()
+    main_layout.setSpacing(6)
+    main_layout.setContentsMargins(10, 10, 10, 10)
+
+    # =============================================
+    # 1. LIVE STATE MONITOR
+    # =============================================
+    state_group = QGroupBox("State")
+    state_grid = QGridLayout()
+    state_grid.setSpacing(2)
+
+    state_labels = {}
+    fields = [
+        ("action",    "Action"),
+        ("posture",   "Posture"),
+        ("physics",   "Physics"),
+        ("facing",    "Facing"),
+        ("pos",       "Position"),
+        ("vel",       "Velocity"),
+        ("z",         "Z-order"),
+        ("locked",    "Locked"),
+        ("platforms", "Platforms"),
+        ("standing",  "Standing on"),
+    ]
+    for i, (key, label) in enumerate(fields):
+        name_lbl = QLabel(f"{label}:")
+        name_lbl.setFont(mono)
+        name_lbl.setStyleSheet("color: #888;")
+        val_lbl = QLabel("—")
+        val_lbl.setFont(mono)
+        val_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        state_grid.addWidget(name_lbl, i, 0)
+        state_grid.addWidget(val_lbl, i, 1)
+        state_labels[key] = val_lbl
+
+    state_group.setLayout(state_grid)
+    main_layout.addWidget(state_group)
+
+    def _standing_on_text():
+        plat = physics._pull.standing_on
+        if plat is None:
+            return "screen floor"
+        # find the app name from window infos
+        pid = _plat_pid(plat)
+        z = _plat_zidx(plat)
+        try:
+            infos = get_window_infos(own_pid=os.getpid())
+            for info in infos:
+                if info.pid == pid:
+                    name = info.name or "?"
+                    title = (info.title[:20] + "...") if len(info.title) > 20 else info.title
+                    return f"{name} z={z}" + (f" [{title}]" if title else "")
+        except Exception:
+            pass
+        return f"pid={pid} z={z}"
+
+    def refresh_state():
+        pos = player.pos()
+        state_labels["action"].setText(player.current_action())
+        state_labels["posture"].setText(posture_ref[0])
+        state_labels["physics"].setText(physics._state.name)
+        state_labels["facing"].setText(physics._facing)
+        state_labels["pos"].setText(f"{pos.x()}, {pos.y()}")
+        state_labels["vel"].setText(f"{physics._vel.x:.1f}, {physics._vel.y:.1f}")
+        if physics._z_window_number == 0:
+            state_labels["z"].setText("floating")
+            state_labels["z"].setStyleSheet("color: #4a9;")
+        else:
+            state_labels["z"].setText(f"win #{physics._z_window_number} (z={physics._z_index})")
+            state_labels["z"].setStyleSheet("color: #c84;")
+        state_labels["locked"].setText("yes" if physics._event_locked else "no")
+        state_labels["locked"].setStyleSheet("color: #c44;" if physics._event_locked else "")
+        state_labels["platforms"].setText(str(len(physics._platforms)))
+        state_labels["standing"].setText(_standing_on_text())
+
+    dialog._refresh_timer = QTimer()
+    dialog._refresh_timer.setInterval(250)
+    dialog._refresh_timer.timeout.connect(refresh_state)
+    dialog._refresh_timer.start()
+    refresh_state()
+
+    # =============================================
+    # 2. CONTROLS
+    # =============================================
+    ctrl_group = QGroupBox("Controls")
+    ctrl_layout = QVBoxLayout()
+    ctrl_layout.setSpacing(6)
 
     # pause / resume
     paused = [False]
-    pause_btn = QPushButton("⏸ Pause physics")
+    pause_btn = QPushButton("Pause physics")
     def toggle_pause():
         if paused[0]:
             physics.start()
-            pause_btn.setText("⏸ Pause physics")
+            pause_btn.setText("Pause physics")
         else:
             physics.stop()
-            pause_btn.setText("▶ Resume physics")
+            pause_btn.setText("Resume physics")
         paused[0] = not paused[0]
     pause_btn.clicked.connect(toggle_pause)
-    layout.addWidget(pause_btn)
+    ctrl_layout.addWidget(pause_btn)
 
-    # animation picker
-    layout.addWidget(QLabel("Play animation:"))
-    anim_row = QHBoxLayout()
-    combo = QComboBox()
-    actions = sorted(player._actions.keys())
-    combo.addItems(actions)
-    if player.current_action() in actions:
-        combo.setCurrentText(player.current_action())
-    def debug_play():
-        physics.lock_for_event()
-        play_fn(combo.currentText(), force=True)
-        QTimer.singleShot(5000, physics.unlock)
-    play_btn = QPushButton("Play")
-    play_btn.clicked.connect(debug_play)
-    anim_row.addWidget(combo)
-    anim_row.addWidget(play_btn)
-    layout.addLayout(anim_row)
-
-    # restlessness slider
-    layout.addWidget(QLabel(""))
+    # restlessness
+    rest_row = QHBoxLayout()
     rest_label = QLabel(f"Restlessness: {restless.level}")
     rest_slider = QSlider(Qt.Orientation.Horizontal)
     rest_slider.setRange(0, 4)
@@ -199,40 +276,239 @@ def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
                                                 restless._set_level(v)))
     restless.level_changed.connect(lambda v: (rest_label.setText(f"Restlessness: {v}"),
                                               rest_slider.setValue(v)))
-    layout.addWidget(rest_label)
-    layout.addWidget(rest_slider)
-    calm_btn = QPushButton("Force calm (level 0)")
-    calm_btn.clicked.connect(lambda: restless._set_level(0))
-    layout.addWidget(calm_btn)
+    rest_row.addWidget(rest_label)
+    rest_row.addWidget(rest_slider)
+    ctrl_layout.addLayout(rest_row)
 
-    # position offset sliders
-    layout.addWidget(QLabel(""))
-    layout.addWidget(QLabel("Position offset (debug):"))
+    # animation picker
+    anim_row = QHBoxLayout()
+    anim_combo = QComboBox()
+    action_names = sorted(player._actions.keys())
+    anim_combo.addItems(action_names)
+    if player.current_action() in action_names:
+        anim_combo.setCurrentText(player.current_action())
+    def debug_play_anim():
+        physics.lock_for_event()
+        play_fn(anim_combo.currentText(), force=True)
+        QTimer.singleShot(5000, physics.unlock)
+    anim_play_btn = QPushButton("Play anim")
+    anim_play_btn.setToolTip("Play animation only (locks physics)")
+    anim_play_btn.clicked.connect(debug_play_anim)
+    anim_row.addWidget(anim_combo)
+    anim_row.addWidget(anim_play_btn)
+    ctrl_layout.addLayout(anim_row)
+
+    # offset sliders
+    offset_row = QHBoxLayout()
+    offset_row.addWidget(QLabel("Offset:"))
+    offset_sliders = {}
     for axis, getter, setter_fn in [
         ("X", lambda: physics._offset.x, lambda v: physics.set_offset(float(v), physics._offset.y)),
         ("Y", lambda: physics._offset.y, lambda v: physics.set_offset(physics._offset.x, float(v))),
     ]:
-        row = QHBoxLayout()
-        row.addWidget(QLabel(f"{axis}:"))
+        lbl = QLabel(f"{axis}:")
+        lbl.setFixedWidth(16)
         slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(-200, 200)
+        slider.setRange(-25, 25)
         slider.setValue(int(getter()))
-        val_label = QLabel(str(int(getter())))
-        slider.valueChanged.connect(lambda v, lbl=val_label, fn=setter_fn: (lbl.setText(str(v)), fn(v)))
-        row.addWidget(slider)
-        row.addWidget(val_label)
-        layout.addLayout(row)
-        # stash on dialog so reset can find them
-        setattr(dialog, f"_slider_{axis.lower()}", slider)
-
-    reset_btn = QPushButton("Reset offset")
-    reset_btn.clicked.connect(lambda: (dialog._slider_x.setValue(0), dialog._slider_y.setValue(0),
+        val_lbl = QLabel(str(int(getter())))
+        val_lbl.setFixedWidth(28)
+        slider.valueChanged.connect(lambda v, l=val_lbl, fn=setter_fn: (l.setText(str(v)), fn(v)))
+        offset_row.addWidget(lbl)
+        offset_row.addWidget(slider)
+        offset_row.addWidget(val_lbl)
+        offset_sliders[axis] = slider
+    reset_btn = QPushButton("0")
+    reset_btn.setFixedWidth(24)
+    reset_btn.setToolTip("Reset offset")
+    reset_btn.clicked.connect(lambda: (offset_sliders["X"].setValue(0),
+                                       offset_sliders["Y"].setValue(0),
                                        physics.set_offset(0, 0)))
-    layout.addWidget(reset_btn)
+    offset_row.addWidget(reset_btn)
+    ctrl_layout.addLayout(offset_row)
 
-    dialog.setLayout(layout)
-    dialog.show()
-    dialog.exec()
+    ctrl_group.setLayout(ctrl_layout)
+    main_layout.addWidget(ctrl_group)
+
+    # =============================================
+    # 3. ACTIONS
+    # =============================================
+    actions_group = QGroupBox("Actions")
+    actions_layout = QVBoxLayout()
+    actions_layout.setSpacing(6)
+
+    # --- movement (no target) ---
+    move_label = QLabel("Movement:")
+    move_label.setStyleSheet("font-weight: bold;")
+    actions_layout.addWidget(move_label)
+
+    move_row1 = QHBoxLayout()
+    fall_btn = QPushButton("Fall")
+    fall_btn.clicked.connect(physics._start_falling)
+    jump_btn = QPushButton("Jump random")
+    def jump_random():
+        screen = physics._screen_rect()
+        tx = random.randint(screen.left() + 100, screen.right() - 100)
+        ty = random.randint(screen.top(), screen.bottom() - 200)
+        physics.jump_toward(float(tx), float(ty))
+    jump_btn.clicked.connect(jump_random)
+    move_row1.addWidget(fall_btn)
+    move_row1.addWidget(jump_btn)
+    actions_layout.addLayout(move_row1)
+
+    move_row2 = QHBoxLayout()
+    for label, direction, sprint in [
+        ("Walk L", -1, False), ("Walk R", 1, False),
+        ("Sprint L", -1, True), ("Sprint R", 1, True),
+    ]:
+        btn = QPushButton(label)
+        btn.clicked.connect(lambda checked=False, d=direction, s=sprint:
+                            physics._start_walking(d, sprint=s))
+        move_row2.addWidget(btn)
+    actions_layout.addLayout(move_row2)
+
+    # --- separator ---
+    sep = QFrame()
+    sep.setFrameShape(QFrame.Shape.HLine)
+    sep.setFrameShadow(QFrame.Shadow.Sunken)
+    actions_layout.addWidget(sep)
+
+    # --- window-targeted actions ---
+    target_label = QLabel("Window target:")
+    target_label.setStyleSheet("font-weight: bold;")
+    actions_layout.addWidget(target_label)
+
+    # window picker
+    win_row = QHBoxLayout()
+    win_combo = QComboBox()
+    win_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+    _window_infos = []  # stash for lookup
+
+    def refresh_windows():
+        nonlocal _window_infos
+        win_combo.clear()
+        try:
+            all_infos = get_window_infos(own_pid=os.getpid())
+            # filter to windows on miku's current screen + exclude parent process
+            screen = physics._screen_rect()
+            _window_infos = [info for info in all_infos
+                             if info.rect.intersects(screen) and info.pid != os.getppid()]
+            for info in _window_infos:
+                title = (info.title[:25] + "..") if len(info.title) > 25 else (info.title or "—")
+                label = f"z{info.z_index} {info.name}: {title}"
+                win_combo.addItem(label)
+        except Exception as e:
+            win_combo.addItem(f"(error: {e})")
+            _window_infos = []
+
+    refresh_windows()
+    refresh_win_btn = QPushButton("Refresh")
+    refresh_win_btn.setFixedWidth(60)
+    refresh_win_btn.clicked.connect(refresh_windows)
+    win_row.addWidget(win_combo, 1)
+    win_row.addWidget(refresh_win_btn)
+    actions_layout.addLayout(win_row)
+
+    # corner picker
+    corner_row = QHBoxLayout()
+    corner_row.addWidget(QLabel("Corner:"))
+    corner_left = QRadioButton("Left")
+    corner_right = QRadioButton("Right")
+    corner_left.setChecked(True)
+    corner_group = QButtonGroup()
+    corner_group.addButton(corner_left)
+    corner_group.addButton(corner_right)
+    corner_row.addWidget(corner_left)
+    corner_row.addWidget(corner_right)
+    corner_row.addStretch()
+    actions_layout.addLayout(corner_row)
+
+    def _selected_window():
+        """Return (rect, pid, corner) for the selected window, or None.
+        Refreshes the rect from the live platform list if possible."""
+        idx = win_combo.currentIndex()
+        if idx < 0 or idx >= len(_window_infos):
+            return None
+        info = _window_infos[idx]
+        corner = "left" if corner_left.isChecked() else "right"
+        for plat in physics._platforms:
+            if plat[1] == info.pid:
+                return plat[0], info.pid, corner
+        return info.rect, info.pid, corner
+
+    # states where window actions can't fire
+    from claudemeji.physics import PhysicsState as _PS
+    _blocked_states = {_PS.DRAGGED, _PS.CARRYING_WINDOW, _PS.PUSHING_WINDOW, _PS.PEEKING}
+
+    # action buttons — all use jump_and_do (jump to corner, then act on landing)
+    win_action_btns = []
+
+    win_actions_row1 = QHBoxLayout()
+    for label, action_key in [
+        ("Jump to", "jump_to"),
+        ("Push", "push"),
+        ("Peek", "peek"),
+    ]:
+        btn = QPushButton(label)
+        def make_handler(action=action_key):
+            def handler():
+                sel = _selected_window()
+                if sel is None:
+                    return
+                rect, pid, corner = sel
+                if action == "jump_to":
+                    mw = float(player.width())
+                    mh = float(player.height())
+                    tx = float(rect.left()) if corner == "left" else float(rect.right()) - mw
+                    ty = float(rect.top()) - mh
+                    physics.jump_toward(tx, ty)
+                else:
+                    physics.jump_and_do(action, rect, pid, corner)
+            return handler
+        btn.clicked.connect(make_handler())
+        win_actions_row1.addWidget(btn)
+        win_action_btns.append(btn)
+    actions_layout.addLayout(win_actions_row1)
+
+    win_actions_row2 = QHBoxLayout()
+    for label, action_key in [
+        ("Carry", "carry"),
+        ("Throw", "throw"),
+        ("Side toss", "side_toss"),
+    ]:
+        btn = QPushButton(label)
+        def make_handler2(action=action_key):
+            def handler():
+                sel = _selected_window()
+                if sel is None:
+                    return
+                rect, pid, corner = sel
+                if action == "carry":
+                    # carry already jumps to window as part of its sequence
+                    physics.start_window_carry(rect, pid, corner)
+                else:
+                    physics.jump_and_do(action, rect, pid, corner)
+            return handler
+        btn.clicked.connect(make_handler2())
+        win_actions_row2.addWidget(btn)
+        win_action_btns.append(btn)
+    actions_layout.addLayout(win_actions_row2)
+
+    # gray out window action buttons when in a blocked state
+    def _update_button_states():
+        blocked = physics._state in _blocked_states
+        no_windows = len(_window_infos) == 0
+        for btn in win_action_btns:
+            btn.setEnabled(not blocked and not no_windows)
+    dialog._refresh_timer.timeout.connect(_update_button_states)
+    _update_button_states()
+
+    actions_group.setLayout(actions_layout)
+    main_layout.addWidget(actions_group)
+
+    dialog.setLayout(main_layout)
+    dialog.show()  # non-modal — miku keeps running
+    _debug_dialog = dialog
 
 
 # --- main ---
@@ -297,10 +573,17 @@ def main():
     player.show()
 
     # macOS window fixes (reapplied periodically — Qt resets them)
+    # only reapply when she's floating (otherwise it fights z-ordering)
+    _z_lowered = [False]  # mutable ref: True when layered with a non-top window
+
+    def _reapply_pin():
+        if not _z_lowered[0]:
+            apply_macos_window_fixes(player)
+
     QTimer.singleShot(100, lambda: apply_macos_window_fixes(player))
     _pin_timer = QTimer()
     _pin_timer.setInterval(2000)
-    _pin_timer.timeout.connect(lambda: apply_macos_window_fixes(player))
+    _pin_timer.timeout.connect(_reapply_pin)
     _pin_timer.start()
 
     # --- physics ---
@@ -321,12 +604,12 @@ def main():
 
     def refresh_platforms():
         if windows_available():
-            infos = get_window_infos(own_pid=os.getpid())
+            platforms = get_platform_tuples(own_pid=os.getpid())
             # filter to windows that overlap miku's current screen,
             # and exclude our parent process (don't toss our own terminal!)
             screen = physics._screen_rect()
-            platforms = [(info.rect, info.pid) for info in infos
-                         if info.rect.intersects(screen) and info.pid != _parent_pid]
+            platforms = [p for p in platforms
+                         if p[0].intersects(screen) and p[1] != _parent_pid]
             physics.update_platforms(platforms)
         else:
             physics.update_platforms([])
@@ -350,6 +633,22 @@ def main():
     physics.window_throw.connect(on_window_throw)
     physics.window_toss_up.connect(
         lambda pid, rect: _ax_threaded(_wrangler.toss_window_up, pid, rect))
+
+    # z-ordering: layer miku with the window she's interacting with
+    def on_z_context_changed(window_number, z_index):
+        if window_number == 0 or z_index < 0:
+            # float above everything
+            if _z_lowered[0]:
+                _z_lowered[0] = False
+                set_window_floating(player)
+                print("[claudemeji] z-order: floating (above all)")
+        else:
+            # layer with a specific window
+            _z_lowered[0] = True
+            set_window_above(player, window_number)
+            print(f"[claudemeji] z-order: above window #{window_number} (z={z_index})")
+
+    physics.z_context_changed.connect(on_z_context_changed)
 
     # --- accessibility check ---
 

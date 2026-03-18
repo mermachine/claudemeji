@@ -31,6 +31,8 @@ class WindowInfo:
     rect:  QRect
     title: str = ""
     name:  str = ""   # owner app name
+    window_number: int = 0   # system-wide CGWindowID, used for z-ordering
+    z_index: int = 0         # position in front-to-back order (0 = frontmost)
 
 
 def is_available() -> bool:
@@ -54,6 +56,7 @@ def get_window_infos(own_pid: int | None = None) -> list[WindowInfo]:
         return []
 
     infos = []
+    z_idx = 0
     for win in windows:
         if win.get("kCGWindowLayer", 999) != 0:
             continue
@@ -74,7 +77,10 @@ def get_window_infos(own_pid: int | None = None) -> list[WindowInfo]:
             rect=QRect(x, y, w, h),
             title=win.get("kCGWindowName", "") or "",
             name=win.get("kCGWindowOwnerName", "") or "",
+            window_number=int(win.get("kCGWindowNumber", 0)),
+            z_index=z_idx,
         ))
+        z_idx += 1
 
     return infos
 
@@ -82,3 +88,10 @@ def get_window_infos(own_pid: int | None = None) -> list[WindowInfo]:
 def get_window_rects(own_pid: int | None = None) -> list[QRect]:
     """Convenience wrapper returning just QRects (for physics platform code)."""
     return [info.rect for info in get_window_infos(own_pid)]
+
+
+def get_platform_tuples(own_pid: int | None = None) -> list[tuple]:
+    """Return (QRect, pid, window_number, z_index) tuples for physics.
+    Ordered front-to-back (z_index 0 = frontmost)."""
+    return [(info.rect, info.pid, info.window_number, info.z_index)
+            for info in get_window_infos(own_pid)]
