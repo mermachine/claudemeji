@@ -100,8 +100,48 @@ def _ax_get(element: Any, attribute: str):
         return None, -1
 
 
+_ax_set_pos_errors = 0
+
+# Try to get AXValueCreate via pyobjc (preferred on modern macOS — ctypes bridge is broken on Sequoia)
+_USE_PYOBJC_AXVALUE = False
+_CGPointMake = None
+_AXValueCreate_pyobjc = None
+try:
+    from Quartz import CGPointMake as _CGPointMake
+    from ApplicationServices import AXValueCreate as _AXValueCreate_pyobjc
+    _USE_PYOBJC_AXVALUE = True
+    print("[claudemeji] AX: using pyobjc AXValue path (CGPointMake + AXValueCreate)")
+except ImportError as e:
+    print(f"[claudemeji] AX: pyobjc AXValue not available ({e}), using ctypes fallback")
+
+
 def _ax_set_position(element: Any, x: float, y: float) -> bool:
     """Move an AX window element to (x, y). Returns True on success."""
+    global _ax_set_pos_errors
+
+    # Method 1: pure pyobjc (works on macOS Sequoia where ctypes bridge is broken)
+    if _USE_PYOBJC_AXVALUE:
+        try:
+            pt = _CGPointMake(x, y)
+            val = _AXValueCreate_pyobjc(1, pt)  # 1 = kAXValueTypeCGPoint
+            if val is None:
+                if _ax_set_pos_errors < 3:
+                    print(f"[claudemeji] _ax_set_position: pyobjc AXValueCreate returned None")
+                _ax_set_pos_errors += 1
+                return False
+            err = AXUIElementSetAttributeValue(element, kAXPositionAttribute, val)
+            if err != 0 and _ax_set_pos_errors < 3:
+                print(f"[claudemeji] _ax_set_position (pyobjc): err={err} for ({x}, {y})")
+            if err != 0:
+                _ax_set_pos_errors += 1
+            return err == 0
+        except Exception as e:
+            if _ax_set_pos_errors < 3:
+                print(f"[claudemeji] _ax_set_position (pyobjc): exception: {e}")
+            _ax_set_pos_errors += 1
+            # fall through to ctypes method
+
+    # Method 2: ctypes fallback
     if _AXLib is None:
         return False
     try:
@@ -109,11 +149,17 @@ def _ax_set_position(element: Any, x: float, y: float) -> bool:
         val = _AXLib.AXValueCreate(_kAXValueCGPointType, ctypes.byref(pt))
         if not val:
             return False
-        # AXUIElementSetAttributeValue expects a CFTypeRef; wrap as c_void_p
         err = AXUIElementSetAttributeValue(element, kAXPositionAttribute,
                                            ctypes.c_void_p(val))
+        if err != 0 and _ax_set_pos_errors < 3:
+            print(f"[claudemeji] _ax_set_position (ctypes): err={err} for ({x}, {y})")
+        if err != 0:
+            _ax_set_pos_errors += 1
         return err == 0
-    except Exception:
+    except Exception as e:
+        if _ax_set_pos_errors < 3:
+            print(f"[claudemeji] _ax_set_position (ctypes): exception: {e}")
+        _ax_set_pos_errors += 1
         return False
 
 
@@ -201,6 +247,20 @@ def move_window_by(pid: int, rect: QRect, dx: float, dy: float) -> bool:
     return _ax_set_position(win, float(rect.x()) + dx, float(rect.y()) + dy)
 
 
+def move_window_to(pid: int, target_x: float, target_y: float) -> bool:
+    """
+    Move a window to an absolute position. Uses pid-only matching (no position
+    matching needed) since we know exactly where we want the window.
+    Used by push/carry where the window tracks the sprite in real-time.
+    Note: trust check is done by caller (_ax_threaded), not here.
+    """
+    win = _find_ax_window(pid, rect=None)
+    if win is None:
+        print(f"[claudemeji] move_window_to: no AX window for pid {pid}")
+        return False
+    return _ax_set_position(win, target_x, target_y)
+
+
 def wiggle_window(pid: int, rect: QRect, amplitude: int = 12, shakes: int = 4) -> bool:
     """
     Shake a window horizontally a few pixels — level 3 (grabby).
@@ -253,8 +313,9 @@ def minimize_window(pid: int, rect: QRect) -> bool:
 def throw_and_minimize(pid: int, rect: QRect, screen_rect: QRect,
                        direction: str = "up") -> bool:
     """
-    Throw a window upward in an arc, then minimize it.
-    The visual: window arcs up and over, then vanishes (minimized).
+    Throw a window in a parabolic arc, then minimize it.
+    Faithful to original shimemiku ThrowIE: vx=32, vy=-10, gravity=0.5
+    (scaled for real-time steps rather than per-frame ticks).
     """
     if not is_trusted():
         return False
@@ -263,20 +324,55 @@ def throw_and_minimize(pid: int, rect: QRect, screen_rect: QRect,
         return False
 
     ox, oy = float(rect.x()), float(rect.y())
-    steps = 15
+    # shimemiku-inspired parabolic arc (gentler than original — windows are bigger than IE)
+    vx = 8.0 if direction == "right" else -8.0 if direction == "left" else 0.0
+    vy = -8.0  # initial upward velocity
+    gravity = 0.5
+    steps = 25
     step_s = 0.025
 
-    # arc upward and to the side, with slight rotation feel (wobble x)
-    for i in range(steps + 1):
-        t = i / steps
-        t_ease = t * t
-        nx = ox + (-200 if direction == "left" else 200) * t_ease
-        ny = oy - 300 * (4 * t * (1 - t))  # parabola peaking at 300px above
-        nx += 8 * ((-1) ** i) * (1 - t)     # wobble for "tumbling" feel
-        _ax_set_position(win, nx, ny)
+    cx, cy = ox, oy
+    for i in range(steps):
+        cx += vx
+        vy += gravity
+        cy += vy
+        # tumble wobble (decays over time)
+        wobble = 6 * ((-1) ** i) * max(0, 1.0 - i / steps)
+        _ax_set_position(win, cx + wobble, cy)
         time.sleep(step_s)
 
     return _minimize_ax_window(win)
+
+
+def toss_window_up(pid: int, rect: QRect) -> bool:
+    """
+    Toss a window upward — it bounces up and settles back down.
+    Used by side-toss: miku grabs the side and flicks it up.
+    No minimize — just a playful shove.
+    """
+    if not is_trusted():
+        return False
+    win = _find_ax_window(pid, rect)
+    if win is None:
+        return False
+
+    ox, oy = float(rect.x()), float(rect.y())
+    # bounce: up 80-180px, slight horizontal wobble, then back down
+    toss_height = random.uniform(80, 180)
+    steps = 20
+    step_s = 0.022
+
+    for i in range(steps):
+        t = i / steps
+        # parabolic arc: up then back down to original position
+        arc_y = -toss_height * 4 * t * (1 - t)
+        wobble_x = random.uniform(-3, 3) * (1 - t)  # wobble decays
+        _ax_set_position(win, ox + wobble_x, oy + arc_y)
+        time.sleep(step_s)
+
+    # settle back to original position
+    _ax_set_position(win, ox, oy)
+    return True
 
 
 def toss_window(pid: int, rect: QRect, screen_rect: QRect,

@@ -20,8 +20,8 @@ Behaviors gated by restlessness:
   level 0: calm, basic wandering
   level 1: shorter pauses, starts climbing
   level 2+: cursor following, window peek/push, fast walk
-  level 3+: window push/drag
-  level 4+: window throw (minimize)
+  level 3+: window push/drag, window carry (grab + walk with window)
+  level 4+: window throw (minimize), carry → throw (grab, carry, hurl)
 """
 
 from __future__ import annotations
@@ -72,13 +72,21 @@ CURSOR_LUNGE_COOLDOWN = 25     # ticks between lunges (land + reorient)
 # window pushing/dragging
 WINDOW_PUSH_SPEED     = 1.0
 WINDOW_PUSH_DURATION  = (180, 600)
-WINDOW_PUSH_EMIT_INTERVAL = 3
 
 # window peeking
 WINDOW_PEEK_DURATION  = (120, 300)
 
 # window throwing
 WINDOW_THROW_ARC_STEPS = 15
+
+# window carrying (grab window, walk/run with it, optionally throw)
+CARRY_PERCH_TICKS      = (90, 160)    # ~1.5-2.5s sitting on edge before grab
+CARRY_WALK_DURATION    = (250, 500)   # how long she walks carrying the window
+CARRY_WALK_SPEED       = 1.5          # slower than normal walk (she's hauling a window!)
+CARRY_RUN_SPEED        = 3.0          # still slower than normal run
+CARRY_ABORT_PERCH      = 0.10         # chance to bail after perching (she jumped for this, commit!)
+CARRY_ABORT_PER_TICK   = 0.002        # small per-tick chance to drop window during carry
+CARRY_THROW_CHANCE     = {3: 0.30, 4: 0.55}  # chance to throw vs gently set down at end
 
 # trip/stumble (rare event during run, gated by restlessness)
 TRIP_CHANCE = {2: 0.03, 3: 0.06, 4: 0.10}  # per wander decision while running
@@ -96,7 +104,7 @@ DRAG_INTENSITY_LEVELS = ("calm", "mild", "strong")
 # throw-to-wall (high velocity release → guaranteed wall cling)
 THROW_VELOCITY_THRESHOLD = 6.0    # velocity magnitude to count as "thrown"
 THROWN_WALL_GRAB_CHANCE  = 0.90   # near-guaranteed wall grab when thrown into a wall
-THROW_VELOCITY_SCALE     = 3.5   # amplify release velocity for satisfying throws
+THROW_VELOCITY_SCALE     = 1.5   # amplify release velocity for satisfying throws
 
 # side-climbing window pull
 SIDE_PULL_SPEED       = 0.3
@@ -128,8 +136,9 @@ class PhysicsState(Enum):
     WALL_RIGHT     = auto()
     CEILING        = auto()
     DRAGGED        = auto()
-    PUSHING_WINDOW = auto()
-    PEEKING        = auto()
+    PUSHING_WINDOW  = auto()
+    PEEKING         = auto()
+    CARRYING_WINDOW = auto()
 
 
 class PostureState(Enum):
@@ -143,6 +152,7 @@ class PostureState(Enum):
     HANGING  = "hanging"
     PUSHING  = "pushing"
     PEEKING  = "peeking"
+    CARRYING = "carrying"
 
 
 # --- small state bundles ---
@@ -161,6 +171,7 @@ class ClimbState:
     hanging: bool = False
     window: tuple | None = None   # (QRect, pid) when climbing a window side
     side_pull_counter: int = 0
+    side_pull_cumulative: float = 0.0  # total downward pull applied to window
 
 
 @dataclass
@@ -169,6 +180,34 @@ class PushState:
     corner: str = "left"
     ticks: int = 0
     direction: int = 1
+    window_x: float = 0.0        # current absolute window x position
+    window_y: float = 0.0        # current absolute window y position
+
+
+@dataclass
+class CarryState:
+    window: tuple | None = None   # (QRect, pid)
+    phase: str = "jump"           # jump → grab_fall → carry → throw_windup → done
+    ticks: int = 0
+    walk_dir: int = 1
+    running: bool = False
+    window_x: float = 0.0        # current absolute window x position
+    window_y: float = 0.0        # current absolute window y position
+    grab_y: float = 0.0          # y position to grab the window at (bottom of window)
+    vel_y: float = 0.0           # vertical velocity during jump/grab_fall
+    offset_x: float = 0.0        # fixed offset: window_x = sprite_x + offset_x
+    offset_y: float = 0.0        # fixed offset: window_y = sprite_y + offset_y
+
+    def reset(self):
+        self.window = None
+        self.phase = "jump"
+        self.ticks = 0
+        self.window_x = 0.0
+        self.window_y = 0.0
+        self.grab_y = 0.0
+        self.vel_y = 0.0
+        self.offset_x = 0.0
+        self.offset_y = 0.0
 
 
 @dataclass
@@ -268,8 +307,9 @@ class PhysicsEngine(QObject):
     posture_changed        = pyqtSignal(str)
     facing_changed         = pyqtSignal(str)
     pull_window            = pyqtSignal(int, object, float)
-    push_window_move       = pyqtSignal(int, object, float, float)
+    window_move_to         = pyqtSignal(int, float, float)  # pid, abs_x, abs_y
     window_throw           = pyqtSignal(int, object, str)
+    window_toss_up         = pyqtSignal(int, object)        # pid, rect — toss upward, no minimize
     drag_intensity_changed = pyqtSignal(str)  # "calm", "mild", "strong"
 
     def __init__(self, window, parent=None):
@@ -303,6 +343,7 @@ class PhysicsEngine(QObject):
         self._climb = ClimbState()
         self._push = PushState()
         self._pull = PullState()
+        self._carry = CarryState()
         self._peek_ticks = 0
         self._drop_through_pid: int = 0  # temporarily ignore this platform's pid when falling
 
@@ -352,7 +393,8 @@ class PhysicsEngine(QObject):
 
     def lock_for_event(self):
         if self._state in (PhysicsState.DRAGGED, PhysicsState.FALLING,
-                           PhysicsState.PUSHING_WINDOW, PhysicsState.PEEKING):
+                           PhysicsState.PUSHING_WINDOW, PhysicsState.PEEKING,
+                           PhysicsState.CARRYING_WINDOW):
             return
         self._event_locked = True
         self._walk_dir = 0
@@ -399,10 +441,14 @@ class PhysicsEngine(QObject):
         self.locomotion_action.emit(action)
 
     def _return_to_ground(self):
-        """Transition from push/peek back to grounded idle."""
+        """Transition from push/peek/carry back to grounded idle."""
         self._push.window = None
+        self._walk_dir = 0
+        self._running = False
+        self._sprinting = False
         self._state = PhysicsState.GROUNDED
         self._set_posture(PostureState.STANDING)
+        self.locomotion_action.emit("stand")
         self._schedule_wander()
 
     def _start_wall_climb(self, wall: PhysicsState, window_info: tuple | None = None):
@@ -413,6 +459,7 @@ class PhysicsEngine(QObject):
         self._climb.hanging = False
         self._climb.window = window_info
         self._climb.side_pull_counter = 0
+        self._climb.side_pull_cumulative = 0.0
         self._set_posture(PostureState.CLIMBING)
         self._set_facing("left" if wall == PhysicsState.WALL_LEFT else "right")
         self.locomotion_action.emit("climb")
@@ -455,6 +502,7 @@ class PhysicsEngine(QObject):
         self._thrown = False
         self._drag_intensity = "calm"
         self._pull.reset()
+        self._carry.reset()
         self._state = PhysicsState.DRAGGED
         self._vel = Vec2()
         self._drag_offset = cursor_global - self._window.pos()
@@ -563,6 +611,8 @@ class PhysicsEngine(QObject):
         self._pull.reset()
         self._climb.hanging = False
         self._climb.window = None
+        if dir_x != 0:
+            self._set_facing("right" if dir_x > 0 else "left")
         self._state = PhysicsState.FALLING
         self._set_posture(PostureState.FALLING)
         self.locomotion_action.emit("jump")
@@ -570,6 +620,7 @@ class PhysicsEngine(QObject):
     def jump_burst(self, direction: int = 1):
         self._vel.x = direction * JUMP_IMPULSE_X * 0.8
         self._vel.y = JUMP_IMPULSE_Y * 0.6
+        self._set_facing("right" if direction > 0 else "left")
         self._state = PhysicsState.FALLING
         self._set_posture(PostureState.FALLING)
 
@@ -583,6 +634,8 @@ class PhysicsEngine(QObject):
             corner=corner,
             ticks=random.randint(*WINDOW_PUSH_DURATION),
             direction=1 if corner == "left" else -1,
+            window_x=float(window_rect.x()),
+            window_y=float(window_rect.y()),
         )
         self._set_facing("right" if corner == "left" else "left")
         self._state = PhysicsState.PUSHING_WINDOW
@@ -600,6 +653,47 @@ class PhysicsEngine(QObject):
         self._set_posture(PostureState.PEEKING)
         self.locomotion_action.emit("window_peek")
 
+    def start_window_carry(self, window_rect: QRect, pid: int, corner: str = "left"):
+        """Begin carry sequence: jump to window corner, grab, fall together, walk."""
+        if self._state in (PhysicsState.DRAGGED, PhysicsState.FALLING,
+                           PhysicsState.CARRYING_WINDOW):
+            return
+        pos = self._window.pos()
+        mx = float(pos.x())
+        my = float(pos.y())
+        mh = float(self._window.height())
+
+        # target: bottom corner of the window (she grabs from below)
+        target_x = float(window_rect.left()) if corner == "left" else float(window_rect.right()) - self._window.width()
+        target_y = float(window_rect.bottom()) - mh  # her feet at the window's bottom edge
+        walk_dir = 1 if corner == "left" else -1  # carry away from the corner she grabbed
+
+        # calculate jump velocity to reach the window bottom
+        dy = target_y - my
+        # jump impulse: enough to reach the window, with a bit of extra
+        vy = -max(10.0, min(20.0, abs(dy) * 0.12 + 8.0))
+        dx = target_x - mx
+        vx = max(-10.0, min(10.0, dx * 0.08))
+
+        self._carry = CarryState(
+            window=(window_rect, pid),
+            phase="jump",
+            ticks=120,  # safety timeout for jump phase
+            walk_dir=walk_dir,
+            running=(self._restlessness >= 4 and random.random() < 0.4),
+            window_x=float(window_rect.x()),
+            window_y=float(window_rect.y()),
+            grab_y=target_y,
+            vel_y=vy,
+        )
+        self._vel = Vec2(vx, vy)
+        self._pull.reset()
+        self._state = PhysicsState.CARRYING_WINDOW
+        self._set_posture(PostureState.FALLING)
+        self._set_facing("left" if walk_dir < 0 else "right")
+        self.locomotion_action.emit("jump")
+        print(f"[claudemeji] carry: jump to window corner={corner} vy={vy:.1f} target_y={target_y:.0f}")
+
     def start_window_throw(self, window_rect: QRect, pid: int, corner: str):
         if self._state in (PhysicsState.DRAGGED, PhysicsState.FALLING):
             return
@@ -607,6 +701,19 @@ class PhysicsEngine(QObject):
         throw_dir = "left" if corner == "left" else "right"
         self.locomotion_action.emit("window_throw")
         self.window_throw.emit(pid, window_rect, throw_dir)
+
+    def start_window_side_toss(self, window_rect: QRect, pid: int, corner: str):
+        """Grab the side of a window and toss it upward. No horizontal miku movement."""
+        if self._state in (PhysicsState.DRAGGED, PhysicsState.FALLING,
+                           PhysicsState.CARRYING_WINDOW):
+            return
+        self._set_facing("right" if corner == "left" else "left")
+        self.locomotion_action.emit("window_throw")
+        # toss up — sometimes minimize (rest 4), sometimes just bounce
+        if self._restlessness >= 4 and random.random() < 0.4:
+            self.window_throw.emit(pid, window_rect, "up")
+        else:
+            self.window_toss_up.emit(pid, window_rect)
 
     # --- main tick: dispatch to per-state handlers ---
 
@@ -638,6 +745,8 @@ class PhysicsEngine(QObject):
             x, y = self._tick_pushing(x, y, bounds)
         elif self._state == PhysicsState.PEEKING:
             x, y = self._tick_peeking(x, y, bounds)
+        elif self._state == PhysicsState.CARRYING_WINDOW:
+            x, y = self._tick_carrying(x, y, bounds)
 
         # safety clamp
         x = max(float(left_x), min(x, float(right_x)))
@@ -655,6 +764,10 @@ class PhysicsEngine(QObject):
         old_y = y
         x += self._vel.x
         y += self._vel.y
+
+        # keep facing consistent with horizontal movement during flight
+        if abs(self._vel.x) > 0.5:
+            self._set_facing("right" if self._vel.x > 0 else "left")
 
         # land on surface (ignore drop-through platform)
         target_floor = _find_surface_below(self._platforms, x, old_y, miku_w, miku_h,
@@ -755,8 +868,9 @@ class PhysicsEngine(QObject):
         else:
             self._still_ticks = 0
 
-        # window pull (sprite weight)
-        y = self._tick_window_pull(y)
+        # window pull (sprite weight) — skip when event-locked so she stays put while working
+        if not self._event_locked:
+            y = self._tick_window_pull(y)
 
         # unstick: if on a window (not screen floor) and restless, sometimes jump off
         on_window = abs(self._floor_y - screen_floor) > SURFACE_TOLERANCE
@@ -787,14 +901,16 @@ class PhysicsEngine(QObject):
                 direction = random.choice([-1, 1])
                 self._vel.x = direction * JUMP_IMPULSE_X * 0.5
                 self._vel.y = JUMP_IMPULSE_Y * 0.2  # tiny hop
+                self._set_facing("right" if direction > 0 else "left")
                 self._state = PhysicsState.FALLING
                 self._set_posture(PostureState.FALLING)
                 self.locomotion_action.emit("jump")
                 print(f"[claudemeji] bored on window, hopping off")
                 return x, y
 
-        # edge detection: walked off surface?
-        if not _surface_at(self._platforms, x, self._floor_y, miku_w, miku_h, screen_floor):
+        # edge detection: walked off surface? (skip when event-locked — she's working, don't knock her off)
+        if (not self._event_locked
+                and not _surface_at(self._platforms, x, self._floor_y, miku_w, miku_h, screen_floor)):
             self._pull.reset()
             if self._following_cursor:
                 # chasing cursor off an edge — leap toward it!
@@ -811,6 +927,7 @@ class PhysicsEngine(QObject):
                 # deliberate edge leap: sometimes jump off instead of just falling
                 self._vel.x = self._walk_dir * EDGE_LEAP_IMPULSE_X
                 self._vel.y = EDGE_LEAP_IMPULSE_Y
+                self._set_facing("left" if self._walk_dir < 0 else "right")
                 self._state = PhysicsState.FALLING
                 self._set_posture(PostureState.FALLING)
                 self.locomotion_action.emit("jump")
@@ -858,7 +975,7 @@ class PhysicsEngine(QObject):
                     pull.applied += delta
                     self._floor_y += delta
                     y += delta
-                    self.pull_window.emit(pid, rect, delta)
+                    self.pull_window.emit(pid, rect, pull.applied)
         return y
 
     def _tick_wall(self, x, y, bounds):
@@ -893,8 +1010,9 @@ class PhysicsEngine(QObject):
             self._climb.side_pull_counter += 1
             if self._climb.side_pull_counter >= SIDE_PULL_INTERVAL:
                 self._climb.side_pull_counter = 0
+                self._climb.side_pull_cumulative += SIDE_PULL_SPEED * SIDE_PULL_INTERVAL
                 cw_rect, cw_pid = self._climb.window
-                self.pull_window.emit(cw_pid, cw_rect, SIDE_PULL_SPEED * SIDE_PULL_INTERVAL)
+                self.pull_window.emit(cw_pid, cw_rect, self._climb.side_pull_cumulative)
 
         # reached top of screen wall → transition to ceiling
         if on_screen_edge and y <= ceil_y:
@@ -963,13 +1081,14 @@ class PhysicsEngine(QObject):
         _, _, left_x, right_x = bounds
         push = self._push
 
-        x += push.direction * WINDOW_PUSH_SPEED
+        step = push.direction * WINDOW_PUSH_SPEED
+        x += step
+        push.window_x += step  # window tracks sprite movement 1:1
         push.ticks -= 1
 
-        if push.window and push.ticks % WINDOW_PUSH_EMIT_INTERVAL == 0:
-            pw_rect, pw_pid = push.window
-            dx_push = push.direction * WINDOW_PUSH_SPEED * WINDOW_PUSH_EMIT_INTERVAL
-            self.push_window_move.emit(pw_pid, pw_rect, dx_push, 0)
+        if push.window:
+            _, pw_pid = push.window
+            self.window_move_to.emit(pw_pid, push.window_x, push.window_y)
 
         if push.ticks <= 0 or x <= left_x or x >= right_x:
             x = max(float(left_x), min(x, float(right_x)))
@@ -981,6 +1100,140 @@ class PhysicsEngine(QObject):
         self._peek_ticks -= 1
         if self._peek_ticks <= 0:
             self._return_to_ground()
+        return x, y
+
+    def _tick_carrying(self, x, y, bounds):
+        screen_floor, _, left_x, right_x = bounds
+        carry = self._carry
+        if carry.window is None:
+            self._carry.reset()
+            self._return_to_ground()
+            return x, y
+
+        w_rect, w_pid = carry.window
+        carry.ticks -= 1
+
+        if carry.phase == "jump":
+            # flying toward window corner — normal projectile physics
+            self._vel.y = min(self._vel.y + GRAVITY, MAX_FALL_SPEED)
+            x += self._vel.x
+            y += self._vel.y
+
+            # update facing during flight
+            if abs(self._vel.x) > 0.5:
+                self._set_facing("right" if self._vel.x > 0 else "left")
+
+            # reached window height (or close enough) → grab!
+            close_enough = abs(y - carry.grab_y) < float(self._window.height()) * 0.5
+            if y <= carry.grab_y + 10 or (self._vel.y >= 0 and close_enough):
+                # snap to window corner — both x and y
+                w_rect_now = carry.window[0]
+                if carry.walk_dir > 0:
+                    # grabbed left corner, snap to left edge
+                    x = carry.window_x
+                else:
+                    # grabbed right corner, snap to right edge
+                    x = carry.window_x + float(w_rect_now.width()) - float(self._window.width())
+                y = carry.grab_y  # snap exactly to grab point
+                # lock offset: window position = sprite position + offset (forever in sync)
+                carry.offset_x = carry.window_x - x
+                carry.offset_y = carry.window_y - y
+                carry.phase = "grab_fall"
+                carry.vel_y = max(0, self._vel.y)  # keep any downward momentum
+                self._vel = Vec2()
+                self._set_posture(PostureState.CARRYING)
+                self._set_facing("left" if carry.walk_dir < 0 else "right")
+                self.locomotion_action.emit("window_carry_perch")
+                print(f"[claudemeji] carry: GRABBED window at ({x:.0f}, {y:.0f})")
+
+            # abort: timed out, hit ground, or apex too far from target
+            missed_apex = self._vel.y >= 0 and not close_enough
+            if carry.ticks <= 0 or y >= screen_floor or missed_apex:
+                if missed_apex:
+                    print(f"[claudemeji] carry: jump too short (y={y:.0f}, target={carry.grab_y:.0f}), aborting")
+                else:
+                    print("[claudemeji] carry: jump missed window, aborting")
+                self._carry.reset()
+                self._vel.y = max(0, self._vel.y)  # keep falling naturally
+                self._state = PhysicsState.FALLING
+                self._set_posture(PostureState.FALLING)
+                self.locomotion_action.emit("fall")
+                return x, y
+
+        elif carry.phase == "grab_fall":
+            # falling together — sprite and window drop as one
+            carry.vel_y = min(carry.vel_y + GRAVITY, MAX_FALL_SPEED)
+            y += carry.vel_y
+            # window derived from sprite position + locked offset
+            carry.window_x = x + carry.offset_x
+            carry.window_y = y + carry.offset_y
+            self.window_move_to.emit(w_pid, carry.window_x, carry.window_y)
+
+            # landed — lift window to hold height, then start carrying!
+            if y >= screen_floor:
+                y = screen_floor
+                # adjust offset so window is held ~2/3 up her body
+                mh = float(self._window.height())
+                carry.offset_y -= mh * 0.6
+                carry.window_x = x + carry.offset_x
+                carry.window_y = y + carry.offset_y
+                self.window_move_to.emit(w_pid, carry.window_x, carry.window_y)
+                carry.vel_y = 0
+                carry.phase = "carry"
+                carry.ticks = random.randint(*CARRY_WALK_DURATION)
+                action = "window_carry_run" if carry.running else "window_carry"
+                self.locomotion_action.emit(action)
+                print(f"[claudemeji] carry: landed! walking with window "
+                      f"({'run' if carry.running else 'walk'}, {carry.ticks} ticks)")
+
+        elif carry.phase == "carry":
+            # walking/running with the window following
+            speed = CARRY_RUN_SPEED if carry.running else CARRY_WALK_SPEED
+            step = carry.walk_dir * speed
+            x += step
+            # window derived from sprite position — always perfectly in sync
+            carry.window_x = x + carry.offset_x
+            self.window_move_to.emit(w_pid, carry.window_x, carry.window_y)
+
+            # per-tick abort chance (she might just... drop it)
+            if random.random() < CARRY_ABORT_PER_TICK:
+                print("[claudemeji] carry: abort mid-carry (oops, dropped it)")
+                self._carry.reset()
+                self._return_to_ground()
+                return x, y
+
+            # hit screen edge or ticks expired → throw or drop
+            at_edge = x <= left_x or x >= right_x
+            if carry.ticks <= 0 or at_edge:
+                x = max(float(left_x), min(x, float(right_x)))
+                throw_chance = CARRY_THROW_CHANCE.get(self._restlessness, 0)
+                if random.random() < throw_chance:
+                    carry.phase = "throw_windup"
+                    carry.ticks = 20
+                    self.locomotion_action.emit("window_carry_throw")
+                    print("[claudemeji] carry: winding up to THROW!")
+                else:
+                    print("[claudemeji] carry: set window down gently")
+                    self._carry.reset()
+                    self._return_to_ground()
+                    return x, y
+
+        elif carry.phase == "throw_windup":
+            carry.window_x = x + carry.offset_x
+            self.window_move_to.emit(w_pid, carry.window_x, carry.window_y)
+            if carry.ticks <= 0:
+                throw_dir = "left" if carry.walk_dir < 0 else "right"
+                current_rect = QRect(int(carry.window_x), int(carry.window_y),
+                                     w_rect.width(), w_rect.height())
+                print(f"[claudemeji] carry: THROW window! (dir={throw_dir})")
+                self.window_throw.emit(w_pid, current_rect, throw_dir)
+                self.locomotion_action.emit("window_carry_cheer")
+                self._carry.reset()
+                self._state = PhysicsState.GROUNDED
+                self._set_posture(PostureState.STANDING)
+                self._schedule_wander()
+                return x, y
+
         return x, y
 
     # --- wander decisions ---
@@ -1061,6 +1314,7 @@ class PhysicsEngine(QObject):
             self._sprinting = False
             self._following_cursor = False
             self._set_posture(PostureState.STANDING)
+            self.locomotion_action.emit("stand")
 
         self._schedule_wander()
 
@@ -1073,6 +1327,8 @@ class PhysicsEngine(QObject):
             behaviors.append(("cursor", cursor_chance))
         if rest >= 2:
             behaviors.append(("window_near", 0.15))
+        if rest >= 3:
+            behaviors.append(("window_carry", 0.20))
         window_seek = WINDOW_SEEK_CHANCE.get(rest, 0)
         if window_seek > 0:
             behaviors.append(("window_seek", window_seek))
@@ -1099,6 +1355,22 @@ class PhysicsEngine(QObject):
                     print(f"[claudemeji] special: window interact near corner={corner} (rest={rest})")
                     self._do_window_interaction(w_rect, w_pid, corner)
                     return True
+            elif behavior == "window_carry":
+                target = self._pick_random_window()
+                if target:
+                    corner, w_rect, w_pid = target
+                    # only carry windows whose bottom is above miku's feet
+                    # (she needs to reach under to grab it)
+                    miku_feet = float(self._window.pos().y()) + float(self._window.height())
+                    if float(w_rect.bottom()) < miku_feet - 10:
+                        print(f"[claudemeji] special: CARRY window (pid={w_pid}, corner={corner}, rest={rest})")
+                        self.start_window_carry(w_rect, w_pid, corner)
+                        return True
+                    # window too low to carry — side toss instead!
+                    elif rest >= 3:
+                        print(f"[claudemeji] special: SIDE TOSS window (pid={w_pid}, corner={corner}, rest={rest})")
+                        self.start_window_side_toss(w_rect, w_pid, corner)
+                        return True
             elif behavior == "window_seek":
                 target = self._pick_random_window()
                 if target:
@@ -1115,17 +1387,15 @@ class PhysicsEngine(QObject):
         rest = self._restlessness
         roll = random.random()
         if rest >= 4 and roll < 0.25:
-            print(f"[claudemeji] window interaction: THROW (pid={w_pid}, corner={corner})")
-            self.start_window_throw(w_rect, w_pid, corner)
+            print(f"[claudemeji] window interaction: SIDE TOSS (pid={w_pid}, corner={corner})")
+            self.start_window_side_toss(w_rect, w_pid, corner)
         elif rest >= 3 and roll < 0.50:
             print(f"[claudemeji] window interaction: PUSH (pid={w_pid}, corner={corner})")
             self.start_window_push(w_rect, w_pid, corner)
-        elif roll < 0.60:
+        else:
+            # rest 2: peek only. rest 3+: peek or push
             print(f"[claudemeji] window interaction: PEEK (pid={w_pid}, corner={corner})")
             self.start_window_peek(w_rect, w_pid, corner)
-        else:
-            print(f"[claudemeji] window interaction: PUSH (pid={w_pid}, corner={corner})")
-            self.start_window_push(w_rect, w_pid, corner)
 
     def _try_cursor_follow(self) -> bool:
         """Start a cursor chase: sprint toward cursor, then lunge at it a few times."""
@@ -1309,6 +1579,19 @@ class PhysicsEngine(QObject):
         self._set_posture(PostureState.STANDING)
         self.locomotion_action.emit("stand")
         self._schedule_wander()
+
+    def _platform_standing_on(self):
+        """Return (QRect, pid) if miku is standing on a window, else None."""
+        if self._state != PhysicsState.GROUNDED:
+            return None
+        screen = self._screen_rect()
+        screen_floor = float(screen.bottom() - self._window.height())
+        if abs(self._floor_y - screen_floor) < SURFACE_TOLERANCE:
+            return None  # on the screen floor, not a window
+        miku_w = float(self._window.width())
+        miku_h = float(self._window.height())
+        x = float(self._window.pos().x())
+        return _find_platform_at(self._platforms, x, self._floor_y, miku_w, miku_h, screen_floor)
 
     def _nearby_window(self, max_dist: float = 200.0):
         """Find a window near miku for interaction. Returns (corner, QRect, pid) or None.

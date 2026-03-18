@@ -16,6 +16,7 @@ import argparse
 import random
 import subprocess
 import threading
+import queue
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt, QTimer
 
@@ -32,7 +33,7 @@ import claudemeji.window_wrangler as _wrangler
 REACTION_LOCK_MS = 4000
 TOOL_SAFETY_LOCK_MS = 30000
 UNINTERRUPTABLE = {"fall", "drag", "react_good", "react_bad", "subagent", "spawned",
-                   "jump", "window_throw", "trip"}
+                   "jump", "window_throw", "window_carry_cheer", "trip"}
 # actions that always hard-cut, never queue behind an outro
 FORCE_ACTIONS = {"drag", "fall", "react_bad"}
 
@@ -40,9 +41,31 @@ FORCE_ACTIONS = {"drag", "fall", "react_bad"}
 # --- threaded AX helper ---
 
 _ax_skip_count = 0
+_ax_queue = queue.Queue()
+_ax_worker_running = False
+
+def _ax_worker():
+    """Single persistent worker thread for AX API calls."""
+    while True:
+        fn, args = _ax_queue.get()
+        if fn is None:
+            break
+        try:
+            result = fn(*args)
+            if fn.__name__ not in ("move_window_by", "move_window_to"):
+                print(f"[claudemeji] AX {fn.__name__} → {result}")
+        except Exception as e:
+            print(f"[claudemeji] AX error in {fn.__name__}: {e}")
+
+def _ensure_ax_worker():
+    global _ax_worker_running
+    if not _ax_worker_running:
+        _ax_worker_running = True
+        t = threading.Thread(target=_ax_worker, daemon=True)
+        t.start()
 
 def _ax_threaded(fn, *args):
-    """Run an AX API call on a daemon thread (avoids blocking the UI)."""
+    """Queue an AX API call for the worker thread (avoids blocking the UI)."""
     global _ax_skip_count
     if not _wrangler.is_trusted():
         _ax_skip_count += 1
@@ -50,14 +73,21 @@ def _ax_threaded(fn, *args):
             print(f"[claudemeji] AX call skipped — no Accessibility permission ({_ax_skip_count} total skips)")
         return
     _ax_skip_count = 0
-    def _safe():
-        try:
-            result = fn(*args)
-            if fn.__name__ != "move_window_by":  # don't spam for per-tick moves
-                print(f"[claudemeji] AX {fn.__name__} → {result}")
-        except Exception as e:
-            print(f"[claudemeji] AX error in {fn.__name__}: {e}")
-    threading.Thread(target=_safe, daemon=True).start()
+    _ensure_ax_worker()
+    # for per-tick moves, drop stale entries (only latest position matters)
+    if fn.__name__ in ("move_window_to", "move_window_by"):
+        # drain any pending move calls — only the latest matters
+        drained = 0
+        while not _ax_queue.empty():
+            try:
+                peek_fn, _ = _ax_queue.get_nowait()
+                if peek_fn.__name__ not in ("move_window_to", "move_window_by"):
+                    # put non-move calls back... actually just drop, they're stale too
+                    pass
+                drained += 1
+            except queue.Empty:
+                break
+    _ax_queue.put((fn, args))
 
 
 # --- idle / drag resolution ---
@@ -286,10 +316,18 @@ def main():
         physics._facing = facing
 
     # platform refresh
+    # protect our parent process (e.g. Terminal running us) from being minimized
+    _parent_pid = os.getppid()
+
     def refresh_platforms():
         if windows_available():
             infos = get_window_infos(own_pid=os.getpid())
-            physics.update_platforms([(info.rect, info.pid) for info in infos])
+            # filter to windows that overlap miku's current screen,
+            # and exclude our parent process (don't toss our own terminal!)
+            screen = physics._screen_rect()
+            platforms = [(info.rect, info.pid) for info in infos
+                         if info.rect.intersects(screen) and info.pid != _parent_pid]
+            physics.update_platforms(platforms)
         else:
             physics.update_platforms([])
 
@@ -302,14 +340,16 @@ def main():
     # window interactions (all delegated to threaded AX calls)
     physics.pull_window.connect(
         lambda pid, rect, dy: _ax_threaded(_wrangler.move_window_by, pid, rect, 0, dy))
-    physics.push_window_move.connect(
-        lambda pid, rect, dx, dy: _ax_threaded(_wrangler.move_window_by, pid, rect, dx, dy))
+    physics.window_move_to.connect(
+        lambda pid, x, y: _ax_threaded(_wrangler.move_window_to, pid, x, y))
 
     def on_window_throw(pid, rect, direction):
         print(f"[claudemeji] THROW window (pid={pid}, dir={direction})")
         _ax_threaded(_wrangler.throw_and_minimize, pid, rect, physics._screen_rect(), direction)
 
     physics.window_throw.connect(on_window_throw)
+    physics.window_toss_up.connect(
+        lambda pid, rect: _ax_threaded(_wrangler.toss_window_up, pid, rect))
 
     # --- accessibility check ---
 
@@ -344,12 +384,8 @@ def main():
                 return
             target = random.choice(infos)
             screen_rect = physics._screen_rect()
-            if level >= 4:
-                print(f"[claudemeji] FERAL — tossing {target.name!r} window")
-                _ax_threaded(_wrangler.toss_window, target.pid, target.rect, screen_rect)
-            else:
-                print(f"[claudemeji] grabby — wiggling {target.name!r} window")
-                _ax_threaded(_wrangler.wiggle_window, target.pid, target.rect)
+            # disabled: window chaos comes from miku's visible interactions only
+            pass
             if not _wrangler.is_trusted() and _wrangler.is_available():
                 _wrangler.request_trust()
         except Exception as e:
@@ -413,12 +449,14 @@ def main():
         # these override everything, even event lock
         always_force = ("climb", "ceiling", "hang", "hang_ceiling",
                         "jump", "window_push", "window_peek", "window_throw",
+                        "window_carry_perch", "window_carry", "window_carry_run",
+                        "window_carry_throw", "window_carry_cheer",
                         "trip", "fall")
         if action in always_force:
             _play(action, force=True)
         elif action == "land":
-            if not physics._event_locked:
-                _play(random.choice(["stand", "sit_idle"]), force=True)
+            # always play land animation — even when event-locked, she needs to stop falling
+            _play(random.choice(["stand", "sit_idle"]), force=True)
         elif action == "idle":
             if not physics._event_locked:
                 _play(_resolve_idle(config, restless.level), force=True)
