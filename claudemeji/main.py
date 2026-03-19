@@ -104,27 +104,17 @@ def _resolve_idle(config: Config | None, restlessness: int) -> str:
     return random.choice(pool)
 
 
-def _resolve_drag_context(config: Config | None, restlessness: int,
-                          intensity: str = "calm") -> str | None:
-    """Pick drag context: try r{level}_{intensity}, fall back to r{level}, then base.
-    Two axes: restlessness picks the anger tier, intensity picks the dangle variant."""
+def _resolve_drag_context(config: Config | None, restlessness: int) -> str | None:
+    """Pick drag context based on restlessness tier (r0-r4), falling back to lower tiers."""
     if not config:
         return None
     base = config.actions.get("drag")
     if not base:
         return None
-    # try most specific first, then fall back
     for lvl in range(restlessness, -1, -1):
-        if intensity != "calm":
-            key = f"r{lvl}_{intensity}"
-            if key in base.contexts:
-                return key
         key = f"r{lvl}"
         if key in base.contexts:
             return key
-    # try bare intensity (no restlessness tier)
-    if intensity != "calm" and intensity in base.contexts:
-        return intensity
     return None
 
 
@@ -602,11 +592,7 @@ def main():
 
     if config:
         try:
-            if config.pack.is_file_based:
-                player.set_image_dir(config.pack.img_dir_path)
-            else:
-                player.load_sheet(config.pack.sheet_path, config.pack.frame_width,
-                                  config.pack.frame_height)
+            player.set_image_dir(config.pack.img_dir_path)
             for name, action_def in config.actions.items():
                 player.register_action(name, action_def)
             player.play(args.entry_action)
@@ -743,14 +729,13 @@ def main():
     # --- animation plumbing ---
 
     _current_posture = ["standing"]
-    _drag_intensity = ["calm"]  # mutable ref for drag intensity axis
 
     def _play(action: str, force: bool = False):
         if action in ("sit_idle", "idle"):
             action = _resolve_idle(config, restless.level)
         resolved_name = config.resolve_action(action) if config else action
         posture = _current_posture[0]
-        context = (_resolve_drag_context(config, restless.level, _drag_intensity[0])
+        context = (_resolve_drag_context(config, restless.level)
                    if action == "drag" else None)
         player.play(resolved_name, posture=posture, context=context,
                     force=(force or action in FORCE_ACTIONS))
@@ -765,22 +750,15 @@ def main():
     physics.posture_changed.connect(on_posture_changed)
     physics.facing_changed.connect(player.set_facing)
 
-    # drag — intensity changes re-resolve the drag animation mid-drag
+    # drag
     def on_drag_start(pos):
         physics.on_drag_start(pos)
         restless.notify_grabbed()
-        _drag_intensity[0] = "calm"
         _play("drag")
-
-    def on_drag_intensity(intensity):
-        _drag_intensity[0] = intensity
-        if player.current_action() == "drag":
-            _play("drag", force=True)
 
     player.drag_started.connect(on_drag_start)
     player.drag_moved.connect(physics.on_drag_move)
     player.drag_released.connect(lambda pos: (physics.on_drag_release(pos), _play("fall")))
-    physics.drag_intensity_changed.connect(on_drag_intensity)
 
     # one-shot finished
     def on_one_shot_finished():

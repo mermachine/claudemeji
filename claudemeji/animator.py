@@ -800,7 +800,7 @@ class AnimatorWindow(QMainWindow):
         self._current_phase = "loop"  # "intro" | "loop" | "outro"
 
         self._action_defs: dict[str, ActionDef] = {
-            a: ActionDef(files=[], fps=8, loop=True, next_action="sit_idle")
+            a: ActionDef(files=[], fps=8, loop=True)
             for a in ACTIONS
         }
 
@@ -1234,19 +1234,12 @@ class AnimatorWindow(QMainWindow):
         if base:
             for i in range(len(base.variants)):
                 keys.append(f"variants/{i}")
-        # previous variants: show any that already have frames defined,
-        # plus all canonical actions as options
-        for a in ACTIONS:
-            if a != action_name:
-                keys.append(f"previous/{a}")
         return keys
 
     def _variant_label_text(self, key: str) -> str:
         if key == "base":
             return "base"
         kind, name = key.split("/", 1)
-        if kind == "previous":
-            return f"from: {name}"
         if kind == "variants":
             return f"variant {chr(65 + int(name))}"  # A, B, C...
         return f"{kind[:-1]}: {name}"
@@ -1278,8 +1271,6 @@ class AnimatorWindow(QMainWindow):
             return base.postures.get(name, ActionDef(files=[], fps=8, loop=True))
         if kind == "contexts":
             return base.contexts.get(name, ActionDef(files=[], fps=8, loop=True))
-        if kind == "previous":
-            return base.previous.get(name, ActionDef(files=[], fps=8, loop=True))
         if kind == "variants":
             idx = int(name)
             if 0 <= idx < len(base.variants):
@@ -1307,7 +1298,7 @@ class AnimatorWindow(QMainWindow):
         self._preview.set_img_dir(img_dir)
 
         self._action_defs = {
-            a: ActionDef(files=[], fps=8, loop=True, next_action="sit_idle")
+            a: ActionDef(files=[], fps=8, loop=True)
             for a in ACTIONS
         }
         self._current_variant = "base"
@@ -1355,7 +1346,7 @@ class AnimatorWindow(QMainWindow):
 
         from claudemeji.config import _parse_action_def
         self._action_defs = {
-            a: ActionDef(files=[], fps=8, loop=True, next_action="sit_idle")
+            a: ActionDef(files=[], fps=8, loop=True)
             for a in ACTIONS
         }
         for name, adef_raw in data.get("actions", {}).items():
@@ -1560,7 +1551,6 @@ class AnimatorWindow(QMainWindow):
                 outro_files=new_def.outro_files,
                 postures=base.postures,
                 contexts=base.contexts,
-                previous=base.previous,
                 variants=base.variants,
                 min_restlessness=new_def.min_restlessness,
                 walk_speed=new_def.walk_speed,
@@ -1573,8 +1563,6 @@ class AnimatorWindow(QMainWindow):
                 base.postures[name] = new_def
             elif kind == "contexts":
                 base.contexts[name] = new_def
-            elif kind == "previous":
-                base.previous[name] = new_def
             elif kind == "variants":
                 idx = int(name)
                 if 0 <= idx < len(base.variants):
@@ -1828,7 +1816,6 @@ class AnimatorWindow(QMainWindow):
             var_has = (
                 any(v.files or v.intro_files or v.outro_files for v in adef.postures.values()) or
                 any(v.files or v.intro_files or v.outro_files for v in adef.contexts.values()) or
-                any(v.files or v.intro_files or v.outro_files for v in adef.previous.values()) or
                 any(v.files or v.intro_files or v.outro_files for v in adef.variants)
             )
             if not base_has and not var_has:
@@ -1841,9 +1828,6 @@ class AnimatorWindow(QMainWindow):
 
             for ctx_name, cdef in adef.contexts.items():
                 _emit_def(cdef, f"actions.{action_name}.contexts.{ctx_name}")
-
-            for prev_name, prev_def in adef.previous.items():
-                _emit_def(prev_def, f"actions.{action_name}.previous.{prev_name}")
 
             for i, vdef in enumerate(adef.variants):
                 vname = chr(ord('a') + i)  # a, b, c...

@@ -45,8 +45,6 @@ ACTIONS = [
     "window_throw",      # throwing a window (arc + minimize)
     "window_carry",      # walking with a grabbed window
     "window_carry_perch",# perched on window corner before grabbing
-    "window_carry_run",  # running with a grabbed window
-    "window_carry_throw",# winding up to throw a carried window
     "window_carry_cheer",# celebration after throwing a carried window
 ]
 
