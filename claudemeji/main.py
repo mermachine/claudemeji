@@ -128,6 +128,53 @@ def _resolve_drag_context(config: Config | None, restlessness: int,
     return None
 
 
+# --- tray icon ---
+
+def _make_mushroom_icon():
+    """Draw a bold mushroom silhouette for the system tray.
+    Menu bar icons need to be simple, high-contrast glyphs —
+    no fine detail, just recognizable shape at 22px."""
+    from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath
+    from PyQt6.QtCore import Qt, QPointF
+
+    size = 44  # 2x for retina, renders at 22pt
+    px = QPixmap(size, size)
+    px.fill(QColor(0, 0, 0, 0))
+
+    p = QPainter(px)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    fg = QColor(240, 240, 240)  # white-ish, standard for dark menu bars
+
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(fg))
+
+    # stem: solid tapered rectangle
+    stem = QPainterPath()
+    stem.moveTo(16, 26)
+    stem.lineTo(28, 26)
+    stem.lineTo(27, 39)
+    stem.quadTo(22, 42, 17, 39)
+    stem.closeSubpath()
+    p.drawPath(stem)
+
+    # cap: big solid dome, the main recognizable shape
+    cap = QPainterPath()
+    cap.moveTo(4, 27)
+    cap.quadTo(4, 7, 22, 5)
+    cap.quadTo(40, 7, 40, 27)
+    cap.closeSubpath()
+    p.drawPath(cap)
+
+    # two spots punched out of the cap (transparent holes = visual detail)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+    p.drawEllipse(QPointF(15, 17), 3.5, 3.5)
+    p.drawEllipse(QPointF(28, 13), 3, 3)
+
+    p.end()
+    return px
+
+
 # --- debug panel ---
 
 # keep a reference so the non-modal dialog doesn't get garbage collected
@@ -811,6 +858,54 @@ def main():
 
     player.add_context_action("Debug panel…",
                               lambda: _show_debug_panel(player, physics, restless, _play, _current_posture))
+
+    # --- system tray icon ---
+
+    from PyQt6.QtWidgets import QSystemTrayIcon, QMenu
+    from PyQt6.QtGui import QIcon
+
+    tray_icon = QSystemTrayIcon(QIcon(_make_mushroom_icon()), app)
+    tray_icon.setToolTip("claudemeji")
+
+    tray_menu = QMenu()
+    tray_menu.setStyleSheet("""
+        QMenu { background: #1c1c32; color: #e2e8f0; border: 1px solid #2a2a4a; }
+        QMenu::item:selected { background: #3730a3; }
+        QMenu::separator { background: #2a2a4a; height: 1px; }
+    """)
+
+    # show/hide
+    _visible = [True]
+    def toggle_visibility():
+        if _visible[0]:
+            player.hide()
+            show_action.setText("Show")
+        else:
+            player.show()
+            show_action.setText("Hide")
+        _visible[0] = not _visible[0]
+    show_action = tray_menu.addAction("Hide", toggle_visibility)
+
+    # debug panel
+    tray_menu.addAction("Debug panel…",
+                        lambda: _show_debug_panel(player, physics, restless, _play, _current_posture))
+
+    tray_menu.addSeparator()
+
+    # restlessness submenu
+    rest_menu = tray_menu.addMenu("Restlessness")
+    for level in range(5):
+        label = {0: "0 - Calm", 1: "1 - Fidgety", 2: "2 - Climby",
+                 3: "3 - Grabby", 4: "4 - Feral"}[level]
+        rest_menu.addAction(label, lambda l=level: restless._set_level(l))
+
+    tray_menu.addSeparator()
+    tray_menu.addAction("Quit", app.quit)
+
+    tray_icon.setContextMenu(tray_menu)
+    tray_icon.activated.connect(lambda reason: toggle_visibility()
+                                if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+    tray_icon.show()
 
     # --- solo mode (no event watching) ---
 
