@@ -64,18 +64,16 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "stand":         "Neutral standing pose (no-animation default)",
     "walk":          "Walking (flipped programmatically for direction)",
     "run":           "Fast walk (restless locomotion variant)",
+    "sprint":        "Full dash at high restlessness",
+    "crawl":         "Deliberate belly crawl movement",
+    "trip":          "Stumble/pratfall during run (one-shot)",
     "jump":          "Impulse jump toward a target",
     "fall":          "Falling / thrown",
     "climb":         "Wall climbing (flipped for right wall)",
     "ceiling":       "Ceiling crawl (flipped for direction)",
     "hang":          "Hanging/dangling on a wall (stationary)",
     "hang_ceiling":  "Hanging from ceiling (stationary)",
-    "sit_idle":      "Sitting idle animation (from idle pool, not default)",
-    "idle1":         "Idle tier 1 — configurable min_restlessness",
-    "idle2":         "Idle tier 2 — configurable min_restlessness",
-    "idle3":         "Idle tier 3 — configurable min_restlessness",
-    "idle4":         "Idle tier 4 — configurable min_restlessness",
-    "idle5":         "Idle tier 5 — configurable min_restlessness",
+    "sit_idle":      "Sitting idle animation (from idle pool)",
     "plan":          "Planning mode — EnterPlanMode tool",
     "think":         "Thinking between tool calls",
     "read":          "Reading — Read/Grep/Glob tools",
@@ -87,9 +85,14 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "drag":          "Being picked up / dragged",
     "subagent":      "Parent split animation — spawning a subagent (Agent/Task tools)",
     "spawned":       "Subagent entrance — jump up from parent, fall down",
-    "window_push":   "Pushing/dragging a window (restlessness >= 2)",
-    "window_peek":   "Peeking from a window corner (restlessness >= 2)",
-    "window_throw":  "Throwing a window — arc + minimize (restlessness >= 4)",
+    "window_push":        "Pushing/dragging a window (restlessness >= 2)",
+    "window_peek":        "Peeking from a window corner (restlessness >= 2)",
+    "window_throw":       "Throwing a window — arc + minimize (restlessness >= 4)",
+    "window_carry":       "Walking with a grabbed window",
+    "window_carry_perch": "Perched on window corner before grabbing",
+    "window_carry_run":   "Running with a grabbed window",
+    "window_carry_throw": "Winding up to throw a carried window",
+    "window_carry_cheer": "Celebration after throwing a carried window",
 }
 
 ACTION_POSTURES: dict[str, list[str]] = {
@@ -811,7 +814,17 @@ class AnimatorWindow(QMainWindow):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
-        # ── top bar: pack info + load/save ──
+        top_btn_style = f"""
+            QPushButton {{
+                background: {C_SURFACE}; border: 1px solid {C_BORDER};
+                padding: 6px 14px; border-radius: 4px; color: {C_TEXT};
+                font-size: 12px;
+            }}
+            QPushButton:hover {{ background: {C_ACCENT_DIM}; border-color: {C_ACCENT}; }}
+        """
+        small_label_style = f"color: {C_TEXT_DIM}; font-size: 11px;"
+
+        # ── top bar: pack info + load/save + global settings ──
         top = QHBoxLayout()
         top.setSpacing(8)
         self._pack_label = QLabel("No pack loaded")
@@ -823,33 +836,53 @@ class AnimatorWindow(QMainWindow):
         btn_load.clicked.connect(self._load_config_file)
         btn_save = QPushButton("Save Config")
         btn_save.clicked.connect(self._save_config)
-
         for btn in (btn_open, btn_load, btn_save):
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: {C_SURFACE}; border: 1px solid {C_BORDER};
-                    padding: 6px 14px; border-radius: 4px; color: {C_TEXT};
-                    font-size: 12px;
-                }}
-                QPushButton:hover {{ background: {C_ACCENT_DIM}; border-color: {C_ACCENT}; }}
-            """)
+            btn.setStyleSheet(top_btn_style)
 
         top.addWidget(self._pack_label, 1)
         top.addWidget(btn_open)
         top.addWidget(btn_load)
         top.addWidget(btn_save)
+
+        # global settings (pack-wide, not per-action)
+        top.addSpacing(16)
+        sep_lbl = QLabel("|")
+        sep_lbl.setStyleSheet(f"color: {C_BORDER}; font-size: 14px;")
+        top.addWidget(sep_lbl)
+        top.addSpacing(4)
+
+        facing_lbl = QLabel("Faces:")
+        facing_lbl.setStyleSheet(small_label_style)
+        facing_lbl.setToolTip("Which direction sprites face natively (before any flipping)")
+        top.addWidget(facing_lbl)
+        self._facing_combo = QComboBox()
+        self._facing_combo.addItems(["left", "right"])
+        self._facing_combo.setCurrentText("left")
+        self._facing_combo.setFixedWidth(60)
+        top.addWidget(self._facing_combo)
+
+        top.addSpacing(8)
+        pull_lbl = QLabel("Pull:")
+        pull_lbl.setStyleSheet(small_label_style)
+        pull_lbl.setToolTip("How far (px) sprite weight pulls windows down (0 = disabled)")
+        top.addWidget(pull_lbl)
+        self._window_pull_spin = QSpinBox()
+        self._window_pull_spin.setRange(0, 200)
+        self._window_pull_spin.setValue(0)
+        self._window_pull_spin.setFixedWidth(60)
+        top.addWidget(self._window_pull_spin)
+
         root.addLayout(top)
 
-        # ── main area: [action list + controls | preview + transport] | [sprite palette] ──
+        # ── main area: [action list | preview + transport | sprite palette] ──
         main_split = QSplitter(Qt.Orientation.Horizontal)
 
-        # ── left column: action list + edit controls ──
+        # ── left column: action list + variant selector ──
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(8)
 
-        # action list
         action_header = QLabel("Actions")
         action_header.setStyleSheet(f"color: {C_TEXT}; font-size: 13px; font-weight: bold;")
         left_layout.addWidget(action_header)
@@ -872,13 +905,38 @@ class AnimatorWindow(QMainWindow):
                 background: {C_BORDER};
             }}
         """)
-        for a in ACTIONS:
-            item = QListWidgetItem(a)
-            item.setToolTip(ACTION_DESCRIPTIONS.get(a, ""))
-            self._action_list.addItem(item)
+        self._custom_actions: list[str] = []  # dynamic idle actions
+        self._rebuild_action_list()
         self._action_list.setCurrentRow(0)
         self._action_list.currentTextChanged.connect(self._on_action_selected)
         left_layout.addWidget(self._action_list, 1)
+
+        # add/remove custom idle buttons
+        idle_btn_row = QHBoxLayout()
+        variant_btn_style = f"""
+            QToolButton {{
+                background: {C_SURFACE}; border: 1px solid {C_BORDER};
+                color: {C_TEXT}; font-size: 14px; font-weight: bold;
+                min-width: 24px; min-height: 24px; border-radius: 4px;
+            }}
+            QToolButton:hover {{ background: {C_ACCENT_DIM}; border-color: {C_ACCENT}; }}
+            QToolButton:disabled {{ color: {C_TEXT_MUTED}; }}
+        """
+        add_idle_btn = QToolButton()
+        add_idle_btn.setText("+ Add idle")
+        add_idle_btn.setToolTip("Add a custom idle animation (appears in idle pool)")
+        add_idle_btn.setStyleSheet(variant_btn_style + "QToolButton { min-width: 80px; font-size: 11px; }")
+        add_idle_btn.clicked.connect(self._add_custom_idle)
+        self._remove_idle_btn = QToolButton()
+        self._remove_idle_btn.setText("\u2212 Remove")
+        self._remove_idle_btn.setToolTip("Remove selected custom idle")
+        self._remove_idle_btn.setStyleSheet(variant_btn_style + "QToolButton { min-width: 80px; font-size: 11px; }")
+        self._remove_idle_btn.setEnabled(False)
+        self._remove_idle_btn.clicked.connect(self._remove_custom_idle)
+        idle_btn_row.addWidget(add_idle_btn)
+        idle_btn_row.addWidget(self._remove_idle_btn)
+        idle_btn_row.addStretch()
+        left_layout.addLayout(idle_btn_row)
 
         # action description
         self._action_desc = QLabel()
@@ -892,23 +950,13 @@ class AnimatorWindow(QMainWindow):
         # variant selector
         variant_row = QHBoxLayout()
         self._variant_label = QLabel("Variant:")
-        self._variant_label.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 11px;")
+        self._variant_label.setStyleSheet(small_label_style)
         self._variant_combo = QComboBox()
         self._variant_combo.setMinimumWidth(140)
         self._variant_combo.currentIndexChanged.connect(self._on_variant_changed)
         variant_row.addWidget(self._variant_label)
         variant_row.addWidget(self._variant_combo, 1)
 
-        # add/remove A/B variant buttons
-        variant_btn_style = f"""
-            QToolButton {{
-                background: {C_SURFACE}; border: 1px solid {C_BORDER};
-                color: {C_TEXT}; font-size: 14px; font-weight: bold;
-                min-width: 24px; min-height: 24px; border-radius: 4px;
-            }}
-            QToolButton:hover {{ background: {C_ACCENT_DIM}; border-color: {C_ACCENT}; }}
-            QToolButton:disabled {{ color: {C_TEXT_MUTED}; }}
-        """
         self._add_variant_btn = QToolButton()
         self._add_variant_btn.setText("+")
         self._add_variant_btn.setToolTip("Add A/B variant (random alternate animation)")
@@ -917,7 +965,7 @@ class AnimatorWindow(QMainWindow):
         variant_row.addWidget(self._add_variant_btn)
 
         self._remove_variant_btn = QToolButton()
-        self._remove_variant_btn.setText("\u2212")  # minus sign
+        self._remove_variant_btn.setText("\u2212")
         self._remove_variant_btn.setToolTip("Remove selected A/B variant")
         self._remove_variant_btn.setStyleSheet(variant_btn_style)
         self._remove_variant_btn.setEnabled(False)
@@ -925,67 +973,6 @@ class AnimatorWindow(QMainWindow):
         variant_row.addWidget(self._remove_variant_btn)
 
         left_layout.addLayout(variant_row)
-
-        # controls: fps, loop, next_action
-        ctrl_grid = QGridLayout()
-        ctrl_grid.setSpacing(6)
-
-        ctrl_grid.addWidget(QLabel("FPS:"), 0, 0)
-        self._fps_spin = QSpinBox()
-        self._fps_spin.setRange(1, 60)
-        self._fps_spin.setValue(8)
-        self._fps_spin.valueChanged.connect(self._on_controls_changed)
-        ctrl_grid.addWidget(self._fps_spin, 0, 1)
-
-        self._loop_check = QCheckBox("Loop")
-        self._loop_check.setChecked(True)
-        self._loop_check.stateChanged.connect(self._on_controls_changed)
-        # physics
-        ctrl_grid.addWidget(QLabel("Window pull:"), 2, 0)
-        self._window_pull_spin = QSpinBox()
-        self._window_pull_spin.setRange(0, 200)
-        self._window_pull_spin.setValue(0)
-        self._window_pull_spin.setToolTip(
-            "How far (px) sprite weight pulls windows down when standing on them (0 = disabled)"
-        )
-        ctrl_grid.addWidget(self._window_pull_spin, 2, 1)
-
-        # default facing
-        ctrl_grid.addWidget(QLabel("Sprite faces:"), 3, 0)
-        self._facing_combo = QComboBox()
-        self._facing_combo.addItems(["left", "right"])
-        self._facing_combo.setCurrentText("left")
-        self._facing_combo.setToolTip("Which direction sprites face natively (before any flipping)")
-        ctrl_grid.addWidget(self._facing_combo, 3, 1)
-
-        # min_restlessness (for idle tier actions)
-        self._min_rest_label = QLabel("Min restless:")
-        self._min_rest_spin = QSpinBox()
-        self._min_rest_spin.setRange(0, 4)
-        self._min_rest_spin.setValue(0)
-        self._min_rest_spin.setToolTip("Minimum restlessness level to include this idle in the pool")
-        self._min_rest_spin.valueChanged.connect(self._on_controls_changed)
-        ctrl_grid.addWidget(self._min_rest_label, 4, 0)
-        ctrl_grid.addWidget(self._min_rest_spin, 4, 1)
-
-        # walk_speed (sprite moves while animating, e.g. crawl)
-        self._walk_speed_label = QLabel("Walk speed:")
-        self._walk_speed_spin = QSpinBox()
-        self._walk_speed_spin.setRange(0, 10)
-        self._walk_speed_spin.setValue(0)
-        self._walk_speed_spin.setToolTip("Movement speed during animation (px/tick, 0 = stationary)")
-        self._walk_speed_spin.valueChanged.connect(self._on_controls_changed)
-        ctrl_grid.addWidget(self._walk_speed_label, 5, 0)
-        ctrl_grid.addWidget(self._walk_speed_spin, 5, 1)
-
-        # idle_tier (joins the idle pool)
-        self._idle_tier_check = QCheckBox("Idle tier")
-        self._idle_tier_check.setToolTip("Include in idle pool (alongside sit_idle, idle1-5)")
-        self._idle_tier_check.stateChanged.connect(self._on_controls_changed)
-        ctrl_grid.addWidget(self._idle_tier_check, 6, 0, 1, 2)
-
-        left_layout.addLayout(ctrl_grid)
-
         main_split.addWidget(left)
 
         # ── center column: preview + transport ──
@@ -1012,28 +999,25 @@ class AnimatorWindow(QMainWindow):
         self._transport.step_forward_clicked.connect(self._preview.step_forward)
         center_layout.addWidget(self._transport)
 
-        # preview info
+        # preview info + onion skin + transition from (grouped under transport)
+        info_row = QHBoxLayout()
+        info_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview_info = QLabel("no frames")
-        self._preview_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview_info.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 11px;")
-        center_layout.addWidget(self._preview_info)
-
-        # onion skin toggle
-        onion_row = QHBoxLayout()
-        onion_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        info_row.addWidget(self._preview_info)
+        info_row.addSpacing(12)
         self._onion_check = QCheckBox("Onion skin")
         self._onion_check.setToolTip("Ghost previous frame at 30% opacity")
         self._onion_check.stateChanged.connect(
             lambda s: self._preview.set_onion_skin(s == Qt.CheckState.Checked.value)
         )
-        onion_row.addWidget(self._onion_check)
-        center_layout.addLayout(onion_row)
+        info_row.addWidget(self._onion_check)
+        center_layout.addLayout(info_row)
 
-        # transition from: test outro → intro flows
         trans_row = QHBoxLayout()
         trans_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
         trans_lbl = QLabel("Transition from:")
-        trans_lbl.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 11px;")
+        trans_lbl.setStyleSheet(small_label_style)
         trans_row.addWidget(trans_lbl)
         self._from_combo = QComboBox()
         self._from_combo.addItem("(none)")
@@ -1056,7 +1040,7 @@ class AnimatorWindow(QMainWindow):
 
         root.addWidget(main_split, 1)
 
-        # ── bottom: phase selector + timeline ──
+        # ── bottom: phase selector + timeline + per-action controls ──
         timeline_header_row = QHBoxLayout()
         tl_label = QLabel("Timeline")
         tl_label.setStyleSheet(f"color: {C_TEXT}; font-size: 13px; font-weight: bold;")
@@ -1081,7 +1065,6 @@ class AnimatorWindow(QMainWindow):
         self._btn_loop  = QPushButton("Loop")
         self._btn_outro = QPushButton("Outro")
 
-        # rounded left / middle / right for segmented look
         self._btn_intro.setStyleSheet(phase_style_inactive + "QPushButton { border-radius: 0; border-top-left-radius: 4px; border-bottom-left-radius: 4px; border-right: none; }")
         self._btn_loop.setStyleSheet(phase_style_active  + "QPushButton { border-radius: 0; border-right: none; }")
         self._btn_outro.setStyleSheet(phase_style_inactive + "QPushButton { border-radius: 0; border-top-right-radius: 4px; border-bottom-right-radius: 4px; }")
@@ -1100,7 +1083,7 @@ class AnimatorWindow(QMainWindow):
         self._btn_loop.clicked.connect(lambda: self._set_phase("loop"))
         self._btn_outro.clicked.connect(lambda: self._set_phase("outro"))
 
-        phase_hint = QLabel("intro/outro play once as transitions  \u00b7  drag to reorder  \u00b7  double-click or del to remove")
+        phase_hint = QLabel("drag to reorder  \u00b7  double-click or del to remove")
         phase_hint.setStyleSheet(f"color: {C_TEXT_MUTED}; font-size: 10px;")
 
         timeline_header_row.addSpacing(8)
@@ -1142,6 +1125,68 @@ class AnimatorWindow(QMainWindow):
         self._timeline.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         tl_scroll.setWidget(self._timeline)
         root.addWidget(tl_scroll)
+
+        # ── per-action controls (below timeline) ──
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(12)
+
+        ctrl_row.addWidget(QLabel("FPS:"))
+        self._fps_spin = QSpinBox()
+        self._fps_spin.setRange(1, 60)
+        self._fps_spin.setValue(8)
+        self._fps_spin.setFixedWidth(60)
+        self._fps_spin.valueChanged.connect(self._on_controls_changed)
+        ctrl_row.addWidget(self._fps_spin)
+
+        self._loop_check = QCheckBox("Loop")
+        self._loop_check.setChecked(True)
+        self._loop_check.stateChanged.connect(self._on_controls_changed)
+        ctrl_row.addWidget(self._loop_check)
+
+        ctrl_row.addSpacing(8)
+
+        # walk speed (conditional)
+        self._walk_speed_label = QLabel("Walk speed:")
+        self._walk_speed_spin = QSpinBox()
+        self._walk_speed_spin.setRange(0, 10)
+        self._walk_speed_spin.setValue(0)
+        self._walk_speed_spin.setFixedWidth(50)
+        self._walk_speed_spin.setToolTip("Movement speed during animation (px/tick)")
+        self._walk_speed_spin.valueChanged.connect(self._on_controls_changed)
+        ctrl_row.addWidget(self._walk_speed_label)
+        ctrl_row.addWidget(self._walk_speed_spin)
+
+        # min restlessness + idle tier (conditional)
+        self._min_rest_label = QLabel("Min restless:")
+        self._min_rest_spin = QSpinBox()
+        self._min_rest_spin.setRange(0, 4)
+        self._min_rest_spin.setValue(0)
+        self._min_rest_spin.setFixedWidth(50)
+        self._min_rest_spin.setToolTip("Minimum restlessness level to include this idle in the pool")
+        self._min_rest_spin.valueChanged.connect(self._on_controls_changed)
+        ctrl_row.addWidget(self._min_rest_label)
+        ctrl_row.addWidget(self._min_rest_spin)
+
+        self._idle_tier_check = QCheckBox("Idle tier")
+        self._idle_tier_check.setToolTip("Include in idle pool")
+        self._idle_tier_check.stateChanged.connect(self._on_controls_changed)
+        ctrl_row.addWidget(self._idle_tier_check)
+
+        ctrl_row.addSpacing(8)
+
+        # offset Y (conditional — for sitting/perching actions)
+        self._offset_y_label = QLabel("Offset Y:")
+        self._offset_y_spin = QSpinBox()
+        self._offset_y_spin.setRange(-50, 50)
+        self._offset_y_spin.setValue(0)
+        self._offset_y_spin.setFixedWidth(60)
+        self._offset_y_spin.setToolTip("Vertical pixel shift while action plays (positive = down)")
+        self._offset_y_spin.valueChanged.connect(self._on_controls_changed)
+        ctrl_row.addWidget(self._offset_y_label)
+        ctrl_row.addWidget(self._offset_y_spin)
+
+        ctrl_row.addStretch()
+        root.addLayout(ctrl_row)
 
         # wire preview frame highlight to timeline
         self._preview.frame_changed.connect(self._timeline.set_highlight)
@@ -1327,7 +1372,7 @@ class AnimatorWindow(QMainWindow):
         self._refresh_action_list()
 
     def _on_action_selected(self, action_name: str):
-        if not action_name:
+        if not action_name or action_name.startswith("---"):
             return
         action_name = action_name.split("  ")[0].strip()  # strip indicators
         self._save_current_to_defs()
@@ -1336,6 +1381,8 @@ class AnimatorWindow(QMainWindow):
             self._action_defs[action_name] = ActionDef(files=[], fps=8, loop=True)
         self._current_action = action_name
         self._current_variant = "base"
+        # enable/disable remove button (only for custom actions)
+        self._remove_idle_btn.setEnabled(action_name in self._custom_actions)
         self._load_action_into_ui(action_name)
 
     def _on_variant_changed(self, index: int):
@@ -1381,21 +1428,23 @@ class AnimatorWindow(QMainWindow):
         self._refresh_action_list()
 
     def _load_action_into_ui(self, action_name: str):
-        desc = ACTION_DESCRIPTIONS.get(action_name, "")
+        desc = ACTION_DESCRIPTIONS.get(action_name, "Custom action")
         self._action_desc.setText(f"{action_name} \u2014 {desc}")
         self._update_variant_selector(action_name)
-        # show idle/movement controls for base variant
         adef = self._action_defs.get(action_name)
+        # conditional visibility for per-action controls
         is_idle_like = (
-            (action_name.startswith("idle") and action_name[4:].isdigit())
+            action_name == "sit_idle"
             or (adef and adef.idle_tier)
-            or self._current_variant == "base"  # always show on base so user can toggle
+            or action_name in self._custom_actions
         )
+        movement_actions = {"walk", "run", "sprint", "crawl"}
+        is_movement = action_name in movement_actions or (adef and adef.walk_speed > 0)
         self._min_rest_label.setVisible(is_idle_like)
         self._min_rest_spin.setVisible(is_idle_like)
-        self._walk_speed_label.setVisible(True)
-        self._walk_speed_spin.setVisible(True)
-        self._idle_tier_check.setVisible(self._current_variant == "base")
+        self._idle_tier_check.setVisible(is_idle_like or self._current_variant == "base")
+        self._walk_speed_label.setVisible(is_movement or self._current_variant == "base")
+        self._walk_speed_spin.setVisible(is_movement or self._current_variant == "base")
         self._populate_controls_from_variant()
         self._update_preview()
 
@@ -1466,6 +1515,10 @@ class AnimatorWindow(QMainWindow):
         self._walk_speed_spin.setValue(int(adef.walk_speed))
         self._walk_speed_spin.blockSignals(False)
 
+        self._offset_y_spin.blockSignals(True)
+        self._offset_y_spin.setValue(adef.offset_y)
+        self._offset_y_spin.blockSignals(False)
+
         # idle_tier only applies to base variant
         base = self._action_defs.get(self._current_action)
         self._idle_tier_check.blockSignals(True)
@@ -1494,6 +1547,7 @@ class AnimatorWindow(QMainWindow):
             outro_files=adef.outro_files,
             min_restlessness=self._min_rest_spin.value(),
             walk_speed=float(self._walk_speed_spin.value()),
+            offset_y=self._offset_y_spin.value(),
         )
 
         base = self._action_defs[self._current_action]
@@ -1510,6 +1564,7 @@ class AnimatorWindow(QMainWindow):
                 variants=base.variants,
                 min_restlessness=new_def.min_restlessness,
                 walk_speed=new_def.walk_speed,
+                offset_y=new_def.offset_y,
                 idle_tier=self._idle_tier_check.isChecked(),
             )
         else:
@@ -1600,25 +1655,84 @@ class AnimatorWindow(QMainWindow):
         self._preview.stop()
 
     def _rebuild_action_list(self):
-        """Rebuild the action list widget to include both canonical and custom actions."""
+        """Rebuild the action list widget: canonical actions + custom idles from config."""
         current = self._current_action
         self._action_list.blockSignals(True)
         self._action_list.clear()
-        # canonical actions first, then any custom ones from config
-        all_names = list(ACTIONS)
-        for name in self._action_defs:
-            if name not in all_names:
-                all_names.append(name)
-        for a in all_names:
+
+        # canonical actions
+        for a in ACTIONS:
             item = QListWidgetItem(a)
-            item.setToolTip(ACTION_DESCRIPTIONS.get(a, "custom action"))
+            item.setToolTip(ACTION_DESCRIPTIONS.get(a, ""))
             self._action_list.addItem(item)
+
+        # discover custom actions from loaded config (not in canonical ACTIONS)
+        self._custom_actions = []
+        for name, adef in self._action_defs.items():
+            if name not in ACTIONS:
+                self._custom_actions.append(name)
+
+        # add custom actions with visual distinction
+        if self._custom_actions:
+            sep = QListWidgetItem("--- custom ---")
+            sep.setFlags(sep.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            sep.setForeground(QColor(C_TEXT_MUTED))
+            self._action_list.addItem(sep)
+            for name in self._custom_actions:
+                adef = self._action_defs.get(name)
+                suffix = " (idle)" if adef and adef.idle_tier else ""
+                item = QListWidgetItem(name)
+                item.setToolTip(f"Custom action{suffix}")
+                self._action_list.addItem(item)
+
         # restore selection
         for i in range(self._action_list.count()):
-            if self._action_list.item(i).text().split("  ")[0].strip() == current:
+            text = self._action_list.item(i).text().split("  ")[0].strip()
+            if text == current:
                 self._action_list.setCurrentRow(i)
                 break
         self._action_list.blockSignals(False)
+
+    def _add_custom_idle(self):
+        """Add a new custom idle action."""
+        from PyQt6.QtWidgets import QInputDialog
+        # find next available idle name
+        existing = set(ACTIONS) | set(self._custom_actions)
+        n = 1
+        while f"idle{n}" in existing:
+            n += 1
+        default_name = f"idle{n}"
+        name, ok = QInputDialog.getText(self, "Add idle", "Action name:", text=default_name)
+        if not ok or not name.strip():
+            return
+        name = name.strip().replace(" ", "_")
+        if name in ACTIONS or name in self._custom_actions:
+            QMessageBox.warning(self, "Duplicate", f"Action '{name}' already exists.")
+            return
+        self._save_current_to_defs()
+        self._custom_actions.append(name)
+        self._action_defs[name] = ActionDef(files=[], fps=8, loop=True, idle_tier=True)
+        self._rebuild_action_list()
+        # select the new action
+        for i in range(self._action_list.count()):
+            if self._action_list.item(i).text().split("  ")[0].strip() == name:
+                self._action_list.setCurrentRow(i)
+                break
+
+    def _remove_custom_idle(self):
+        """Remove the currently selected custom action."""
+        name = self._current_action
+        if name in ACTIONS:
+            return  # can't remove canonical actions
+        if name not in self._custom_actions:
+            return
+        self._custom_actions.remove(name)
+        if name in self._action_defs:
+            del self._action_defs[name]
+        self._current_action = ACTIONS[0]
+        self._rebuild_action_list()
+        self._action_list.setCurrentRow(0)
+        self._load_action_into_ui(self._current_action)
 
     def _refresh_action_list(self):
         for i in range(self._action_list.count()):
@@ -1702,6 +1816,8 @@ class AnimatorWindow(QMainWindow):
                 lines.append(f"min_restlessness = {adef.min_restlessness}\n")
             if adef.walk_speed > 0:
                 lines.append(f"walk_speed = {adef.walk_speed}\n")
+            if adef.offset_y != 0:
+                lines.append(f"offset_y = {adef.offset_y}\n")
             if is_base and adef.idle_tier:
                 lines.append("idle_tier = true\n")
             lines.append("\n")

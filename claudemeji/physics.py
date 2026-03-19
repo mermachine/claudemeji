@@ -403,6 +403,8 @@ class PhysicsEngine(QObject):
         self._following_cursor = False
         self._chase = CursorChaseState()
         self._action_walk_speed = 0.0
+        self._action_offset_y = 0    # per-action vertical shift (e.g. sitting sprites)
+        self._applied_offset_y = 0   # offset that was used in the last move() call
         self._facing = "left"
         self._offset = Vec2()
         self._floor_y = 0.0
@@ -510,6 +512,9 @@ class PhysicsEngine(QObject):
             self._walk_dir = random.choice([-1, 1])
             self._set_facing("left" if self._walk_dir < 0 else "right")
             self._set_posture(PostureState.WALKING)
+
+    def set_action_offset_y(self, offset_y: int):
+        self._action_offset_y = offset_y
 
     def set_offset(self, dx: float, dy: float):
         self._offset = Vec2(dx, dy)
@@ -897,7 +902,9 @@ class PhysicsEngine(QObject):
         screen = self._screen_rect()
         pos = self._window.pos()
         w, h = self._window.width(), self._window.height()
-        x, y = float(pos.x()), float(pos.y())
+        # subtract the offsets that were applied in the LAST move() call
+        x = float(pos.x()) - self._offset.x
+        y = float(pos.y()) - self._offset.y - self._applied_offset_y
 
         screen_floor = float(screen.bottom() - h)
         ceil_y  = screen.top()
@@ -925,7 +932,9 @@ class PhysicsEngine(QObject):
         x = max(float(left_x), min(x, float(right_x)))
         y = max(float(ceil_y), min(y, screen_floor))
 
-        self._window.move(int(x + self._offset.x), int(y + self._offset.y))
+        self._applied_offset_y = self._action_offset_y
+        self._window.move(int(x + self._offset.x),
+                          int(y + self._offset.y + self._action_offset_y))
 
     # --- per-state tick handlers ---
 

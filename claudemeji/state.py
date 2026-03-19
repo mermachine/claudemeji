@@ -27,11 +27,6 @@ ACTIONS = [
     "hang",           # hanging/dangling on a wall (stationary)
     "hang_ceiling",   # hanging from ceiling (stationary)
     "sit_idle",
-    "idle1",          # idle tier 1 (min_restlessness configurable)
-    "idle2",          # idle tier 2
-    "idle3",          # idle tier 3
-    "idle4",          # idle tier 4
-    "idle5",          # idle tier 5
     # claude-specific
     "plan",         # planning mode (EnterPlanMode tool)
     "think",        # between tool calls / processing
@@ -45,9 +40,14 @@ ACTIONS = [
     "subagent",     # parent's split animation when spawning a subagent (Agent/Task tool)
     "spawned",      # subagent entrance animation (jump up from parent, fall down)
     # window interactions (restlessness-gated)
-    "window_push",  # pushing/dragging a window
-    "window_peek",  # peeking from a window corner
-    "window_throw", # throwing a window (arc + minimize)
+    "window_push",       # pushing/dragging a window
+    "window_peek",       # peeking from a window corner
+    "window_throw",      # throwing a window (arc + minimize)
+    "window_carry",      # walking with a grabbed window
+    "window_carry_perch",# perched on window corner before grabbing
+    "window_carry_run",  # running with a grabbed window
+    "window_carry_throw",# winding up to throw a carried window
+    "window_carry_cheer",# celebration after throwing a carried window
 ]
 
 # Map claude code tool names → our action names

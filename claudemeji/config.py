@@ -102,6 +102,7 @@ def _base_fields(d: dict) -> dict:
         intro_files=d.get("intro_files"),
         outro_files=d.get("outro_files"),
         walk_speed=d.get("walk_speed", 0.0),
+        offset_y=d.get("offset_y", 0),
     )
 
 

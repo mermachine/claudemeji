@@ -709,6 +709,7 @@ def main():
                     force=(force or action in FORCE_ACTIONS))
         resolved_def = player.current_def()
         physics.set_action_walk_speed(resolved_def.walk_speed if resolved_def else 0.0)
+        physics.set_action_offset_y(resolved_def.offset_y if resolved_def else 0)
 
     def on_posture_changed(posture):
         _current_posture[0] = posture

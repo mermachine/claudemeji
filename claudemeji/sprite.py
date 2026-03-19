@@ -76,6 +76,7 @@ class ActionDef:
         walk_speed: float = 0.0,      # nonzero = sprite moves while animating (px/tick)
         idle_tier: bool = False,      # if true, eligible for idle pool selection
         variants: list[ActionDef] | None = None,  # A/B variant alternatives
+        offset_y: int = 0,            # vertical pixel shift (positive = down, e.g. for sitting)
     ):
         self.frames = frames or []
         self.files = files or []
@@ -91,6 +92,7 @@ class ActionDef:
         self.walk_speed = walk_speed     # 0 = stationary, >0 = moves while playing
         self.idle_tier = idle_tier       # joins the idle pool when eligible
         self.variants = variants or []   # alternate animations picked randomly
+        self.offset_y = offset_y         # vertical pixel shift while this action plays (e.g. sitting)
 
     def frame_count(self) -> int:
         return len(self.files) if self.files else len(self.frames)
