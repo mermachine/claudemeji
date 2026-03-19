@@ -565,6 +565,15 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
+    # catch Python exceptions in Qt slots — without this, PyQt6 calls abort() and we get
+    # a silent crash with no traceback (only visible in macOS crash reports)
+    def _qt_exception_hook(exc_type, exc_value, exc_tb):
+        import traceback
+        print("[claudemeji] *** UNHANDLED EXCEPTION IN QT SLOT ***", flush=True)
+        traceback.print_exception(exc_type, exc_value, exc_tb)
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    sys.excepthook = _qt_exception_hook
+
     # pid file for Stop hook
     if args.session:
         pid_dir = os.path.expanduser("~/.claudemeji/pids")
