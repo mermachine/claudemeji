@@ -38,6 +38,10 @@ from PyQt6.QtCore import QObject, QTimer, QPoint, QRect, pyqtSignal
 from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import QApplication
 
+from claudemeji.creature import (
+    CreatureState, CreatureEvent, Posture, SpeedTier, CarryPhase, ClimbSurface,
+)
+
 
 # --- constants ---
 
@@ -376,14 +380,14 @@ def _occlusion_wall_ahead(platforms, standing_plat, x: float, walk_dir: int,
 # --- engine ---
 
 class PhysicsEngine(QObject):
-    locomotion_action      = pyqtSignal(str)
+    creature_state_changed = pyqtSignal(object)    # CreatureState snapshot (on change)
+    creature_event         = pyqtSignal(object)    # CreatureEvent (discrete one-shots)
     posture_changed        = pyqtSignal(str)
     facing_changed         = pyqtSignal(str)
     pull_window            = pyqtSignal(int, object, float)
     window_move_to         = pyqtSignal(int, float, float)  # pid, abs_x, abs_y
     window_throw           = pyqtSignal(int, object, str)
     window_toss_up         = pyqtSignal(int, object)        # pid, rect — toss upward, no minimize
-    drag_intensity_changed = pyqtSignal(str)  # "calm", "mild", "strong"
     # z-ordering: emits (window_number, z_index) when miku should be layered
     # with a specific window, or (0, -1) when she should float above everything
     z_context_changed      = pyqtSignal(int, int)  # window_number, z_index
@@ -414,7 +418,6 @@ class PhysicsEngine(QObject):
         self._dragged = False
         self._drag_offset = QPoint()
         self._cursor_history: list[QPoint] = []
-        self._drag_intensity: str = "calm"  # current dangle level during drag
         self._thrown: bool = False           # True after high-velocity release (boosts wall grab)
 
         # grouped state
@@ -435,6 +438,11 @@ class PhysicsEngine(QObject):
         # pending window action: jump to a window, then do something on landing
         # stores (action_name, QRect, pid, corner) or None
         self._pending_window_action: tuple | None = None
+
+        # creature state tracking
+        self._last_creature_state: CreatureState | None = None
+        self._pending_creature_events: list[CreatureEvent] = []
+        self._speed_tier = SpeedTier.STILL
 
         self._timer = QTimer(self)
         self._timer.setInterval(TICK_MS)
@@ -523,20 +531,20 @@ class PhysicsEngine(QObject):
 
     def _start_falling(self):
         self._state = PhysicsState.FALLING
+        self._speed_tier = SpeedTier.STILL
         self._set_posture(PostureState.FALLING)
-        self.locomotion_action.emit("fall")
 
     def _start_walking(self, direction: int, run: bool = False, sprint: bool = False):
         self._walk_dir = direction
         self._still_ticks = 0
         self._running = run or sprint
         self._sprinting = sprint
+        self._speed_tier = SpeedTier.SPRINT if sprint else (SpeedTier.RUN if run else SpeedTier.WALK)
         # note: _following_cursor is NOT cleared here — chase approach uses _start_walking.
         # it's cleared by _end_chase, _decide_wander, lock_for_event, etc. instead.
         self._set_posture(PostureState.WALKING)
         self._set_facing("left" if direction < 0 else "right")
         action = "sprint" if sprint else ("run" if run else "walk")
-        self.locomotion_action.emit(action)
 
     def _return_to_ground(self):
         """Transition from push/peek/carry back to grounded idle."""
@@ -544,10 +552,10 @@ class PhysicsEngine(QObject):
         self._walk_dir = 0
         self._running = False
         self._sprinting = False
+        self._speed_tier = SpeedTier.STILL
         self._state = PhysicsState.GROUNDED
         self._set_posture(PostureState.STANDING)
         self._set_z_context(None)  # back to floating
-        self.locomotion_action.emit("stand")
         self._schedule_wander()
 
     def _start_wall_climb(self, wall: PhysicsState, window_info: tuple | None = None):
@@ -566,7 +574,6 @@ class PhysicsEngine(QObject):
             self._set_z_context(window_info)
         elif window_info is None:
             self._set_z_context(None)  # screen edge = float
-        self.locomotion_action.emit("climb")
 
     def _maybe_hang_or_fall(self, hang_action: str = "hang"):
         """Climb/ceiling expired — either hang or fall."""
@@ -574,7 +581,6 @@ class PhysicsEngine(QObject):
             self._climb.hanging = True
             self._climb.ticks = random.randint(*HANG_DURATION)
             self._set_posture(PostureState.HANGING)
-            self.locomotion_action.emit(hang_action)
         else:
             self._climb.hanging = False
             self._climb.window = None
@@ -588,9 +594,10 @@ class PhysicsEngine(QObject):
         self._still_ticks = 0
         self._running = False
         self._sprinting = False
+        self._speed_tier = SpeedTier.STILL
         self._set_posture(PostureState.STANDING)
         self._schedule_wander()
-        self.locomotion_action.emit("land")
+        self._emit_creature_event(CreatureEvent.LANDED)
         # check if we landed on a window (for weight-pulling + z-ordering)
         miku_w, miku_h = float(self._window.width()), float(self._window.height())
         x = float(self._window.pos().x())
@@ -675,7 +682,6 @@ class PhysicsEngine(QObject):
     def on_drag_start(self, cursor_global: QPoint):
         self._dragged = True
         self._thrown = False
-        self._drag_intensity = "calm"
         self._pull.reset()
         self._carry.reset()
         self._state = PhysicsState.DRAGGED
@@ -684,7 +690,6 @@ class PhysicsEngine(QObject):
         self._cursor_history.clear()
         self._set_posture(PostureState.DRAGGED)
         self._set_z_context(None)  # float when held by user
-        self.locomotion_action.emit("drag")
 
     def on_drag_move(self, cursor_global: QPoint):
         if not self._dragged:
@@ -699,17 +704,6 @@ class PhysicsEngine(QObject):
         sprite_cx = pos.x() + self._window.width() / 2
         cursor_x = cursor_global.x()
         offset = abs(cursor_x - sprite_cx)
-
-        if offset < DRAG_CALM_DISTANCE:
-            intensity = "calm"
-        elif offset < DRAG_MILD_DISTANCE:
-            intensity = "mild"
-        else:
-            intensity = "strong"
-
-        if intensity != self._drag_intensity:
-            self._drag_intensity = intensity
-            self.drag_intensity_changed.emit(intensity)
 
         # update facing based on which side she's dangling from
         # if sprite center is left of cursor, she's dangling left
@@ -738,7 +732,6 @@ class PhysicsEngine(QObject):
             self._vel = Vec2()
             self._thrown = False
 
-        self.locomotion_action.emit("fall")
 
     # --- jumping ---
 
@@ -789,9 +782,10 @@ class PhysicsEngine(QObject):
         self._climb.window = None
         if dir_x != 0:
             self._set_facing("right" if dir_x > 0 else "left")
+        self._speed_tier = SpeedTier.STILL
         self._state = PhysicsState.FALLING
         self._set_posture(PostureState.FALLING)
-        self.locomotion_action.emit("jump")
+        self._emit_creature_event(CreatureEvent.JUMPED)
 
     def jump_burst(self, direction: int = 1):
         self._vel.x = direction * JUMP_IMPULSE_X * 0.8
@@ -818,7 +812,6 @@ class PhysicsEngine(QObject):
         self._set_posture(PostureState.PUSHING)
         self._pull.reset()
         self._set_z_context(self._find_platform_by_pid(pid))
-        self.locomotion_action.emit("window_push")
 
     def start_window_peek(self, window_rect: QRect, pid: int, corner: str):
         if self._state in (PhysicsState.DRAGGED, PhysicsState.FALLING):
@@ -829,7 +822,6 @@ class PhysicsEngine(QObject):
         self._state = PhysicsState.PEEKING
         self._set_posture(PostureState.PEEKING)
         self._set_z_context(self._find_platform_by_pid(pid))
-        self.locomotion_action.emit("window_peek")
 
     def start_window_carry(self, window_rect: QRect, pid: int, corner: str = "left"):
         """Begin carry sequence: jump to window corner, grab, fall together, walk."""
@@ -869,7 +861,7 @@ class PhysicsEngine(QObject):
         self._state = PhysicsState.CARRYING_WINDOW
         self._set_posture(PostureState.FALLING)
         self._set_facing("left" if walk_dir < 0 else "right")
-        self.locomotion_action.emit("jump")
+        self._emit_creature_event(CreatureEvent.JUMPED)
         print(f"[claudemeji] carry: jump to window corner={corner} vy={vy:.1f} target_y={target_y:.0f}")
 
     def start_window_throw(self, window_rect: QRect, pid: int, corner: str):
@@ -877,7 +869,7 @@ class PhysicsEngine(QObject):
             return
         self._set_facing("right" if corner == "left" else "left")
         throw_dir = "left" if corner == "left" else "right"
-        self.locomotion_action.emit("window_throw")
+        self._emit_creature_event(CreatureEvent.THREW_WINDOW)
         self.window_throw.emit(pid, window_rect, throw_dir)
 
     def start_window_side_toss(self, window_rect: QRect, pid: int, corner: str):
@@ -886,12 +878,84 @@ class PhysicsEngine(QObject):
                            PhysicsState.CARRYING_WINDOW):
             return
         self._set_facing("right" if corner == "left" else "left")
-        self.locomotion_action.emit("window_throw")
+        self._emit_creature_event(CreatureEvent.THREW_WINDOW)
         # toss up — sometimes minimize (rest 4), sometimes just bounce
         if self._restlessness >= 4 and random.random() < 0.4:
             self.window_throw.emit(pid, window_rect, "up")
         else:
             self.window_toss_up.emit(pid, window_rect)
+
+    # --- creature state ---
+
+    def _emit_creature_event(self, event: CreatureEvent):
+        """Queue a discrete event for emission at end of tick."""
+        self._pending_creature_events.append(event)
+
+    def _climb_surface(self) -> ClimbSurface:
+        """Derive ClimbSurface from current physics state."""
+        if self._state == PhysicsState.CEILING:
+            return ClimbSurface.CEILING
+        if self._state == PhysicsState.WALL_LEFT:
+            if self._climb.window is not None:
+                return ClimbSurface.WINDOW_LEFT
+            return ClimbSurface.SCREEN_LEFT
+        if self._state == PhysicsState.WALL_RIGHT:
+            if self._climb.window is not None:
+                return ClimbSurface.WINDOW_RIGHT
+            return ClimbSurface.SCREEN_RIGHT
+        # hanging remembers what it was climbing
+        if self._posture == PostureState.HANGING:
+            if self._climb.ceiling_dir != 0:
+                return ClimbSurface.CEILING
+            if self._climb.window is not None:
+                if self._facing == "left":
+                    return ClimbSurface.WINDOW_RIGHT
+                return ClimbSurface.WINDOW_LEFT
+            if self._facing == "left":
+                return ClimbSurface.SCREEN_RIGHT
+            return ClimbSurface.SCREEN_LEFT
+        return ClimbSurface.NONE
+
+    def _carry_phase(self) -> CarryPhase:
+        """Derive CarryPhase from current carry state."""
+        if self._state != PhysicsState.CARRYING_WINDOW:
+            return CarryPhase.NONE
+        phase = self._carry.phase
+        return {
+            "jump": CarryPhase.JUMP,
+            "grab_fall": CarryPhase.GRAB_FALL,
+            "perch": CarryPhase.PERCH,
+            "carry": CarryPhase.CARRY,
+            "throw_windup": CarryPhase.THROW_WINDUP,
+        }.get(phase, CarryPhase.NONE)
+
+    def _posture_to_creature(self) -> Posture:
+        """Map internal PostureState to creature Posture enum."""
+        return Posture(self._posture.value)
+
+    def _build_creature_state(self) -> CreatureState:
+        """Build an immutable snapshot of the creature's current state."""
+        return CreatureState(
+            posture=self._posture_to_creature(),
+            facing=self._facing,
+            speed_tier=self._speed_tier,
+            carry_phase=self._carry_phase(),
+            climb_surface=self._climb_surface(),
+            is_event_locked=self._event_locked,
+            restlessness=self._restlessness,
+        )
+
+    def _flush_creature_state(self):
+        """Emit pending creature events and state snapshot (if changed)."""
+        # events first — they drive one-shot animations before state takes over
+        for event in self._pending_creature_events:
+            self.creature_event.emit(event)
+        self._pending_creature_events.clear()
+
+        state = self._build_creature_state()
+        if state != self._last_creature_state:
+            self._last_creature_state = state
+            self.creature_state_changed.emit(state)
 
     # --- main tick: dispatch to per-state handlers ---
 
@@ -936,6 +1000,8 @@ class PhysicsEngine(QObject):
         self._window.move(int(x + self._offset.x),
                           int(y + self._offset.y + self._action_offset_y))
 
+        self._flush_creature_state()
+
     # --- per-state tick handlers ---
 
     def _tick_falling(self, x, y, bounds):
@@ -974,7 +1040,6 @@ class PhysicsEngine(QObject):
                 self._set_posture(PostureState.CEILING)
                 self._set_z_context(None)  # ceiling = float
                 self._set_facing("right" if self._climb.ceiling_dir > 0 else "left")
-                self.locomotion_action.emit("ceiling")
             else:
                 self._vel.y = abs(self._vel.y) * 0.3
 
@@ -1051,12 +1116,10 @@ class PhysicsEngine(QObject):
                             x = occ_wall
                             self._walk_dir = -self._walk_dir
                             self._set_facing("left")
-                            self.locomotion_action.emit("walk")
                         elif self._walk_dir < 0 and x <= occ_wall:
                             x = occ_wall
                             self._walk_dir = -self._walk_dir
                             self._set_facing("right")
-                            self.locomotion_action.emit("walk")
                     elif self._is_topmost_platform(standing):
                         # walked away from occluder — back to floating
                         self._set_z_context(None)
@@ -1110,9 +1173,10 @@ class PhysicsEngine(QObject):
                 self._vel.x = direction * JUMP_IMPULSE_X * 0.5
                 self._vel.y = JUMP_IMPULSE_Y * 0.2  # tiny hop
                 self._set_facing("right" if direction > 0 else "left")
+                self._speed_tier = SpeedTier.STILL
                 self._state = PhysicsState.FALLING
                 self._set_posture(PostureState.FALLING)
-                self.locomotion_action.emit("jump")
+                self._emit_creature_event(CreatureEvent.JUMPED)
                 print(f"[claudemeji] bored on window, hopping off")
                 return x, y
 
@@ -1136,9 +1200,10 @@ class PhysicsEngine(QObject):
                 self._vel.x = self._walk_dir * EDGE_LEAP_IMPULSE_X
                 self._vel.y = EDGE_LEAP_IMPULSE_Y
                 self._set_facing("left" if self._walk_dir < 0 else "right")
+                self._speed_tier = SpeedTier.STILL
                 self._state = PhysicsState.FALLING
                 self._set_posture(PostureState.FALLING)
-                self.locomotion_action.emit("jump")
+                self._emit_creature_event(CreatureEvent.JUMPED)
             else:
                 self._start_falling()
 
@@ -1155,7 +1220,6 @@ class PhysicsEngine(QObject):
                 return x, True
             self._walk_dir = 1
             self._set_facing("right")
-            self.locomotion_action.emit("walk")
         elif x >= right_x:
             x = right_x
             if random.random() < grab_chance:
@@ -1164,7 +1228,6 @@ class PhysicsEngine(QObject):
                 return x, True
             self._walk_dir = -1
             self._set_facing("left")
-            self.locomotion_action.emit("walk")
         return x, False
 
     def _tick_window_pull(self, y) -> float:
@@ -1233,7 +1296,6 @@ class PhysicsEngine(QObject):
             self._set_posture(PostureState.CEILING)
             self._set_z_context(None)  # ceiling = screen edge, float above everything
             self._set_facing("right" if self._climb.ceiling_dir > 0 else "left")
-            self.locomotion_action.emit("ceiling")
             return x, y
 
         self._climb.ticks -= 1
@@ -1278,7 +1340,6 @@ class PhysicsEngine(QObject):
             self._climb.ceiling_dir = -1
         if self._climb.ceiling_dir != prev_dir:
             self._set_facing("right" if self._climb.ceiling_dir > 0 else "left")
-            self.locomotion_action.emit("ceiling")
 
         self._climb.ticks -= 1
         if self._climb.ticks <= 0:
@@ -1360,7 +1421,6 @@ class PhysicsEngine(QObject):
                 self._vel = Vec2()
                 self._set_posture(PostureState.CARRYING)
                 self._set_facing("left" if carry.walk_dir < 0 else "right")
-                self.locomotion_action.emit("window_carry_perch")
                 print(f"[claudemeji] carry: GRABBED window at ({x:.0f}, {y:.0f})")
 
             # abort: timed out, hit ground, or apex too far from target
@@ -1374,7 +1434,6 @@ class PhysicsEngine(QObject):
                 self._vel.y = max(0, self._vel.y)  # keep falling naturally
                 self._state = PhysicsState.FALLING
                 self._set_posture(PostureState.FALLING)
-                self.locomotion_action.emit("fall")
                 return x, y
 
         elif carry.phase == "grab_fall":
@@ -1399,7 +1458,6 @@ class PhysicsEngine(QObject):
                 carry.phase = "carry"
                 carry.ticks = random.randint(*CARRY_WALK_DURATION)
                 action = "window_carry_run" if carry.running else "window_carry"
-                self.locomotion_action.emit(action)
                 print(f"[claudemeji] carry: landed! walking with window "
                       f"({'run' if carry.running else 'walk'}, {carry.ticks} ticks)")
 
@@ -1427,7 +1485,6 @@ class PhysicsEngine(QObject):
                 if random.random() < throw_chance:
                     carry.phase = "throw_windup"
                     carry.ticks = 20
-                    self.locomotion_action.emit("window_carry_throw")
                     print("[claudemeji] carry: winding up to THROW!")
                 else:
                     print("[claudemeji] carry: set window down gently")
@@ -1444,7 +1501,7 @@ class PhysicsEngine(QObject):
                                      w_rect.width(), w_rect.height())
                 print(f"[claudemeji] carry: THROW window! (dir={throw_dir})")
                 self.window_throw.emit(w_pid, current_rect, throw_dir)
-                self.locomotion_action.emit("window_carry_cheer")
+                self._emit_creature_event(CreatureEvent.CARRY_CHEERED)
                 self._carry.reset()
                 self._state = PhysicsState.GROUNDED
                 self._set_posture(PostureState.STANDING)
@@ -1480,8 +1537,9 @@ class PhysicsEngine(QObject):
                 self._walk_dir = 0
                 self._running = False
                 self._sprinting = False
+                self._speed_tier = SpeedTier.STILL
                 self._set_posture(PostureState.STANDING)
-                self.locomotion_action.emit("trip")
+                self._emit_creature_event(CreatureEvent.TRIPPED)
                 self._schedule_wander()
                 return
 
@@ -1513,17 +1571,16 @@ class PhysicsEngine(QObject):
             self._still_ticks = 0
             self._running = False
             self._sprinting = False
+            self._speed_tier = SpeedTier.CRAWL
             self._following_cursor = False
             self._set_posture(PostureState.WALKING)
             self._set_facing("left" if direction < 0 else "right")
-            self.locomotion_action.emit("crawl")
         elif choice == "idle":
             self._walk_dir = 0
             self._running = False
             self._sprinting = False
             self._following_cursor = False
             self._set_posture(PostureState.STANDING)
-            self.locomotion_action.emit("idle")
         else:
             # stand: stop, hold frame, wander timer picks next
             self._walk_dir = 0
@@ -1531,7 +1588,6 @@ class PhysicsEngine(QObject):
             self._sprinting = False
             self._following_cursor = False
             self._set_posture(PostureState.STANDING)
-            self.locomotion_action.emit("stand")
 
         self._schedule_wander()
 
@@ -1796,7 +1852,6 @@ class PhysicsEngine(QObject):
         # she failed to catch it — brief pause before doing something else
         self._walk_dir = 0
         self._set_posture(PostureState.STANDING)
-        self.locomotion_action.emit("stand")
         self._schedule_wander()
 
     def _platform_standing_on(self):

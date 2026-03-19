@@ -28,6 +28,8 @@ from claudemeji.watcher import HookWatcher
 from claudemeji.platform_utils import apply_macos_window_fixes, set_window_floating, set_window_above
 from claudemeji.windows import get_window_infos, get_platform_tuples, is_available as windows_available
 from claudemeji.restlessness import RestlessnessEngine
+from claudemeji.resolver import resolve_animation
+from claudemeji.creature import CreatureState, CreatureEvent
 import claudemeji.window_wrangler as _wrangler
 
 REACTION_LOCK_MS = 4000
@@ -760,35 +762,48 @@ def main():
     player.drag_moved.connect(physics.on_drag_move)
     player.drag_released.connect(lambda pos: (physics.on_drag_release(pos), _play("fall")))
 
-    # one-shot finished
+    # one-shot finished — clear the oneshot lock so creature state can drive animation again
     def on_one_shot_finished():
+        _oneshot_locked[0] = False
         if physics._event_locked:
             _play(state_machine.state.action)
+        else:
+            # force re-evaluation: state may not have changed but we need to pick up
+            # the post-oneshot animation (e.g. stand/idle after landing)
+            state = physics._build_creature_state()
+            on_creature_state(state)
 
     player.one_shot_finished.connect(on_one_shot_finished)
 
-    # locomotion → animation
-    # all locomotion force-cuts: physics state changes are immediate,
-    # animations must match (no sliding while outro plays, no standing while walking)
-    def on_locomotion(action):
-        # these override everything, even event lock
-        always_force = ("climb", "ceiling", "hang", "hang_ceiling",
-                        "jump", "window_push", "window_peek", "window_throw",
-                        "window_carry_perch", "window_carry", "window_carry_run",
-                        "window_carry_throw", "window_carry_cheer",
-                        "trip", "fall")
-        if action in always_force:
-            _play(action, force=True)
-        elif action == "land":
-            # always play land animation — even when event-locked, she needs to stop falling
-            _play(random.choice(["stand", "sit_idle"]), force=True)
-        elif action == "idle":
-            if not physics._event_locked:
-                _play(_resolve_idle(config, restless.level), force=True)
-        elif not physics._event_locked:
-            _play(action, force=True)
+    # creature state → animation
+    # physics emits creature state snapshots and discrete events;
+    # the resolver maps them to animation action names.
+    _oneshot_locked = [False]
 
-    physics.locomotion_action.connect(on_locomotion)
+    def on_creature_state(state):
+        if _oneshot_locked[0] or state.is_event_locked:
+            return
+        action = resolve_animation(state)
+        if action in ("sit_idle", "idle", "stand"):
+            if state.posture.value == "sitting":
+                action = _resolve_idle(config, restless.level)
+            elif state.posture.value == "standing" and action == "sit_idle":
+                action = _resolve_idle(config, restless.level)
+        # skip if already playing this action (avoids restarting one-frame actions)
+        if player.current_action() == action:
+            return
+        _play(action, force=True)
+
+    def on_creature_event(event):
+        _oneshot_locked[0] = True
+        action = resolve_animation(CreatureState(), event)
+        if action == "land":
+            action = random.choice(["stand", "sit_idle"])
+        _play(action, force=True)
+
+    physics.creature_state_changed.connect(on_creature_state)
+    physics.creature_event.connect(on_creature_event)
+
     physics.start()
 
     # --- state machine + event lock ---
