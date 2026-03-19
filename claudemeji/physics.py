@@ -419,6 +419,7 @@ class PhysicsEngine(QObject):
         self._drag_offset = QPoint()
         self._cursor_history: list[QPoint] = []
         self._thrown: bool = False           # True after high-velocity release (boosts wall grab)
+        self._launched: bool = False         # True while falling upward after a jump
 
         # grouped state
         self._climb = ClimbState()
@@ -561,6 +562,7 @@ class PhysicsEngine(QObject):
     def _start_wall_climb(self, wall: PhysicsState, window_info: tuple | None = None):
         self._state = wall
         self._vel = Vec2()
+        self._launched = False
         self._climb.ticks = random.randint(*self._climb_duration())
         self._climb.pin_x = float(self._window.pos().x())
         self._climb.hanging = False
@@ -589,6 +591,7 @@ class PhysicsEngine(QObject):
     def _land(self, floor_y: float):
         self._floor_y = floor_y
         self._thrown = False
+        self._launched = False
         self._state = PhysicsState.GROUNDED
         self._walk_dir = 0
         self._still_ticks = 0
@@ -785,7 +788,7 @@ class PhysicsEngine(QObject):
         self._speed_tier = SpeedTier.STILL
         self._state = PhysicsState.FALLING
         self._set_posture(PostureState.FALLING)
-        self._emit_creature_event(CreatureEvent.JUMPED)
+        self._launched = True
 
     def jump_burst(self, direction: int = 1):
         self._vel.x = direction * JUMP_IMPULSE_X * 0.8
@@ -861,7 +864,7 @@ class PhysicsEngine(QObject):
         self._state = PhysicsState.CARRYING_WINDOW
         self._set_posture(PostureState.FALLING)
         self._set_facing("left" if walk_dir < 0 else "right")
-        self._emit_creature_event(CreatureEvent.JUMPED)
+        self._launched = True
         print(f"[claudemeji] carry: jump to window corner={corner} vy={vy:.1f} target_y={target_y:.0f}")
 
     def start_window_throw(self, window_rect: QRect, pid: int, corner: str):
@@ -941,6 +944,7 @@ class PhysicsEngine(QObject):
             speed_tier=self._speed_tier,
             carry_phase=self._carry_phase(),
             climb_surface=self._climb_surface(),
+            launched=self._launched,
             is_event_locked=self._event_locked,
             restlessness=self._restlessness,
         )
@@ -1009,6 +1013,9 @@ class PhysicsEngine(QObject):
         miku_w, miku_h = float(self._window.width()), float(self._window.height())
 
         self._vel.y = min(self._vel.y + GRAVITY, MAX_FALL_SPEED)
+        # transition from jump pose to fall pose when descending
+        if self._launched and self._vel.y > 0:
+            self._launched = False
         old_y = y
         x += self._vel.x
         y += self._vel.y
@@ -1176,7 +1183,7 @@ class PhysicsEngine(QObject):
                 self._speed_tier = SpeedTier.STILL
                 self._state = PhysicsState.FALLING
                 self._set_posture(PostureState.FALLING)
-                self._emit_creature_event(CreatureEvent.JUMPED)
+                self._launched = True
                 print(f"[claudemeji] bored on window, hopping off")
                 return x, y
 
@@ -1203,7 +1210,7 @@ class PhysicsEngine(QObject):
                 self._speed_tier = SpeedTier.STILL
                 self._state = PhysicsState.FALLING
                 self._set_posture(PostureState.FALLING)
-                self._emit_creature_event(CreatureEvent.JUMPED)
+                self._launched = True
             else:
                 self._start_falling()
 

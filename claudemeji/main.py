@@ -795,11 +795,13 @@ def main():
         _play(action, force=True)
 
     def on_creature_event(event):
-        _oneshot_locked[0] = True
         action = resolve_animation(CreatureState(), event)
-        if action == "land":
-            action = random.choice(["stand", "sit_idle"])
         _play(action, force=True)
+        # only lock if the animation is actually non-looping —
+        # looping animations never fire one_shot_finished so the lock would stick forever
+        resolved_def = player.current_def()
+        if resolved_def and not resolved_def.loop:
+            _oneshot_locked[0] = True
 
     physics.creature_state_changed.connect(on_creature_state)
     physics.creature_event.connect(on_creature_event)

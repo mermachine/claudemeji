@@ -60,7 +60,6 @@ class CreatureEvent(Enum):
     Emitted once at the moment something happens; animation locks until it finishes."""
     LANDED        = auto()   # fall → ground (bounce)
     TRIPPED       = auto()   # stumbled during movement
-    JUMPED        = auto()   # impulse launch
     THREW_WINDOW  = auto()   # standing throw gesture
     CARRY_CHEERED = auto()   # celebration after carry-throw
 
@@ -75,5 +74,6 @@ class CreatureState:
     speed_tier: SpeedTier = SpeedTier.STILL
     carry_phase: CarryPhase = CarryPhase.NONE
     climb_surface: ClimbSurface = ClimbSurface.NONE
+    launched: bool = False       # True while falling upward after a jump (show jump pose, not fall)
     is_event_locked: bool = False
     restlessness: int = 0

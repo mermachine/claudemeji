@@ -14,7 +14,7 @@ from claudemeji.creature import (
 def resolve_animation(state: CreatureState, event: CreatureEvent | None = None) -> str:
     """Map creature state + optional discrete event to an animation action name.
 
-    Priority: event → carry phase → posture+speed → default.
+    Priority: event → carry phase → launched/falling → posture+speed → default.
     Returns a canonical action name (e.g. "walk", "climb", "fall").
     """
     # discrete events always win — they play as one-shots
@@ -26,6 +26,10 @@ def resolve_animation(state: CreatureState, event: CreatureEvent | None = None) 
         if state.carry_phase == CarryPhase.CARRY:
             return "window_carry"
         return _CARRY_PHASE_ANIMS.get(state.carry_phase, "window_carry")
+
+    # falling: jump pose while launched (upward velocity), fall pose otherwise
+    if state.posture == Posture.FALLING:
+        return "jump" if state.launched else "fall"
 
     # walking speed determines which animation
     if state.posture == Posture.WALKING:
@@ -46,7 +50,6 @@ def resolve_animation(state: CreatureState, event: CreatureEvent | None = None) 
 _EVENT_ANIMS = {
     CreatureEvent.LANDED:        "land",
     CreatureEvent.TRIPPED:       "trip",
-    CreatureEvent.JUMPED:        "jump",
     CreatureEvent.THREW_WINDOW:  "window_throw",
     CreatureEvent.CARRY_CHEERED: "window_carry_cheer",
 }
