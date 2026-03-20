@@ -1,12 +1,11 @@
 """
 main.py - entry point, wires everything together
 
-Animation resolution uses compound state:
-  posture  - what she's physically doing (from PhysicsEngine)
-  context  - for drag: restlessness-tier variant (r0-r4)
-
-_play(action, force=False) resolves the right ActionDef variant and calls
-player.play(name, posture, context).
+Two modes:
+  1. Conductor mode (default, no --session): MikuManager + MultiHookWatcher
+     manages multiple concurrent Miku instances, one per Claude Code session.
+  2. Single-session mode (--session ID or --solo): one MikuSlot, backward compat
+     with the old per-process model.
 """
 from __future__ import annotations
 
@@ -14,33 +13,20 @@ import sys
 import os
 import argparse
 import random
-import subprocess
 import threading
 import queue
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt, QTimer
 
-from claudemeji.config import load as load_config, Config
+from claudemeji.config import load as load_config
 from claudemeji.sprite import SpritePlayer
 from claudemeji.physics import PhysicsEngine
-from claudemeji.state import StateMachine
-from claudemeji.watcher import HookWatcher
-from claudemeji.platform_utils import apply_macos_window_fixes, set_window_floating, set_window_above
 from claudemeji.windows import get_window_infos, get_platform_tuples, is_available as windows_available
 from claudemeji.restlessness import RestlessnessEngine
-from claudemeji.resolver import resolve_animation
-from claudemeji.creature import CreatureState, CreatureEvent
 import claudemeji.window_wrangler as _wrangler
 
-REACTION_LOCK_MS = 4000
-TOOL_SAFETY_LOCK_MS = 30000
-UNINTERRUPTABLE = {"fall", "drag", "react_good", "react_bad", "subagent", "spawned",
-                   "jump", "window_throw", "window_carry_cheer", "trip"}
-# actions that always hard-cut, never queue behind an outro
-FORCE_ACTIONS = {"drag", "fall", "react_bad"}
 
-
-# --- threaded AX helper ---
+# --- threaded AX helper (shared across all slots) ---
 
 _ax_skip_count = 0
 _ax_queue = queue.Queue()
@@ -55,7 +41,7 @@ def _ax_worker():
         try:
             result = fn(*args)
             if fn.__name__ not in ("move_window_by", "move_window_to"):
-                print(f"[claudemeji] AX {fn.__name__} → {result}")
+                print(f"[claudemeji] AX {fn.__name__} \u2192 {result}")
         except Exception as e:
             print(f"[claudemeji] AX error in {fn.__name__}: {e}")
 
@@ -72,61 +58,27 @@ def _ax_threaded(fn, *args):
     if not _wrangler.is_trusted():
         _ax_skip_count += 1
         if _ax_skip_count <= 3 or _ax_skip_count % 50 == 0:
-            print(f"[claudemeji] AX call skipped — no Accessibility permission ({_ax_skip_count} total skips)")
+            print(f"[claudemeji] AX call skipped \u2014 no Accessibility permission ({_ax_skip_count} total skips)")
         return
     _ax_skip_count = 0
     _ensure_ax_worker()
     # for per-tick moves, drop stale entries (only latest position matters)
     if fn.__name__ in ("move_window_to", "move_window_by"):
-        # drain any pending move calls — only the latest matters
-        drained = 0
         while not _ax_queue.empty():
             try:
-                peek_fn, _ = _ax_queue.get_nowait()
-                if peek_fn.__name__ not in ("move_window_to", "move_window_by"):
-                    # put non-move calls back... actually just drop, they're stale too
-                    pass
-                drained += 1
+                _ax_queue.get_nowait()
             except queue.Empty:
                 break
     _ax_queue.put((fn, args))
-
-
-# --- idle / drag resolution ---
-
-def _resolve_idle(config: Config | None, restlessness: int) -> str:
-    """Pick an idle action from the pool based on restlessness level."""
-    if not config:
-        return "sit_idle"
-    pool = ["sit_idle", "stand"]
-    for name, adef in config.actions.items():
-        is_numbered_idle = name.startswith("idle") and name[4:].isdigit()
-        if (is_numbered_idle or adef.idle_tier) and adef.min_restlessness <= restlessness:
-            pool.append(name)
-    return random.choice(pool)
-
-
-def _resolve_drag_context(config: Config | None, restlessness: int) -> str | None:
-    """Pick drag context based on restlessness tier (r0-r4), falling back to lower tiers."""
-    if not config:
-        return None
-    base = config.actions.get("drag")
-    if not base:
-        return None
-    for lvl in range(restlessness, -1, -1):
-        key = f"r{lvl}"
-        if key in base.contexts:
-            return key
-    return None
 
 
 # --- tray icon ---
 
 def _make_mushroom_icon():
     """Draw a bold mushroom silhouette for the system tray.
-    Menu bar icons need to be simple, high-contrast glyphs —
+    Menu bar icons need to be simple, high-contrast glyphs \u2014
     no fine detail, just recognizable shape at 22px."""
-    from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath
+    from PyQt6.QtGui import QPixmap, QPainter, QColor, QBrush, QPainterPath
     from PyQt6.QtCore import Qt, QPointF
 
     size = 44  # 2x for retina, renders at 22pt
@@ -169,23 +121,25 @@ def _make_mushroom_icon():
 
 # --- debug panel ---
 
-# keep a reference so the non-modal dialog doesn't get garbage collected
-_debug_dialog = None
+# per-slot debug dialogs (keyed by panel_id) so multiple can be open
+_debug_dialogs: dict[str, object] = {}
 
 
 def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
-                      restless: RestlessnessEngine, play_fn, posture_ref: list):
+                      restless: RestlessnessEngine, play_fn, posture_ref: list,
+                      panel_id: str = "default"):
     """Non-modal debug panel with live state, controls, and targeted actions."""
-    global _debug_dialog
-    if _debug_dialog is not None:
-        _debug_dialog.raise_()
-        _debug_dialog.activateWindow()
+    global _debug_dialogs
+    existing = _debug_dialogs.get(panel_id)
+    if existing is not None:
+        existing.raise_()
+        existing.activateWindow()
         return
 
     from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
                                  QSlider, QLabel, QPushButton, QComboBox,
                                  QGroupBox, QRadioButton, QButtonGroup,
-                                 QFrame, QScrollArea, QWidget)
+                                 QFrame)
     from PyQt6.QtCore import Qt
     from PyQt6.QtGui import QFont
     from claudemeji.surfaces import plat_rect as _plat_rect, plat_pid as _plat_pid, plat_zidx as _plat_zidx
@@ -194,13 +148,13 @@ def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
     mono.setPointSize(11)
 
     dialog = QDialog()
-    dialog.setWindowTitle("claudemeji debug")
+    short_id = panel_id[:12] if len(panel_id) > 12 else panel_id
+    dialog.setWindowTitle(f"claudemeji debug [{short_id}]")
     dialog.setMinimumWidth(380)
     dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
 
     def on_close():
-        global _debug_dialog
-        _debug_dialog = None
+        _debug_dialogs.pop(panel_id, None)
     dialog.destroyed.connect(on_close)
 
     main_layout = QVBoxLayout()
@@ -231,7 +185,7 @@ def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
         name_lbl = QLabel(f"{label}:")
         name_lbl.setFont(mono)
         name_lbl.setStyleSheet("color: #888;")
-        val_lbl = QLabel("—")
+        val_lbl = QLabel("\u2014")
         val_lbl.setFont(mono)
         val_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         state_grid.addWidget(name_lbl, i, 0)
@@ -245,7 +199,6 @@ def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
         plat = physics._pull.standing_on
         if plat is None:
             return "screen floor"
-        # find the app name from window infos
         pid = _plat_pid(plat)
         z = _plat_zidx(plat)
         try:
@@ -428,12 +381,11 @@ def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
         win_combo.clear()
         try:
             all_infos = get_window_infos(own_pid=os.getpid())
-            # filter to windows on miku's current screen + exclude parent process
             screen = physics._screen_rect()
             _window_infos = [info for info in all_infos
                              if info.rect.intersects(screen) and info.pid != os.getppid()]
             for info in _window_infos:
-                title = (info.title[:25] + "..") if len(info.title) > 25 else (info.title or "—")
+                title = (info.title[:25] + "..") if len(info.title) > 25 else (info.title or "\u2014")
                 label = f"z{info.z_index} {info.name}: {title}"
                 win_combo.addItem(label)
         except Exception as e:
@@ -463,8 +415,6 @@ def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
     actions_layout.addLayout(corner_row)
 
     def _selected_window():
-        """Return (rect, pid, corner) for the selected window, or None.
-        Refreshes the rect from the live platform list if possible."""
         idx = win_combo.currentIndex()
         if idx < 0 or idx >= len(_window_infos):
             return None
@@ -475,11 +425,9 @@ def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
                 return plat[0], info.pid, corner
         return info.rect, info.pid, corner
 
-    # states where window actions can't fire
     from claudemeji.physics import PhysicsState as _PS
     _blocked_states = {_PS.DRAGGED, _PS.CARRYING_WINDOW, _PS.PUSHING_WINDOW, _PS.PEEKING}
 
-    # action buttons — all use jump_and_do (jump to corner, then act on landing)
     win_action_btns = []
 
     win_actions_row1 = QHBoxLayout()
@@ -523,7 +471,6 @@ def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
                     return
                 rect, pid, corner = sel
                 if action == "carry":
-                    # carry already jumps to window as part of its sequence
                     physics.start_window_carry(rect, pid, corner)
                 else:
                     physics.jump_and_do(action, rect, pid, corner)
@@ -533,7 +480,6 @@ def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
         win_action_btns.append(btn)
     actions_layout.addLayout(win_actions_row2)
 
-    # gray out window action buttons when in a blocked state
     def _update_button_states():
         blocked = physics._state in _blocked_states
         no_windows = len(_window_infos) == 0
@@ -546,15 +492,126 @@ def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
     main_layout.addWidget(actions_group)
 
     dialog.setLayout(main_layout)
-    dialog.show()  # non-modal — miku keeps running
-    _debug_dialog = dialog
+    dialog.show()  # non-modal
+    _debug_dialogs[panel_id] = dialog
+
+
+# --- tray builders ---
+
+def _build_tray_conductor(app, manager):
+    """Build the system tray icon for conductor mode (multi-session)."""
+    from PyQt6.QtWidgets import QSystemTrayIcon, QMenu
+    from PyQt6.QtGui import QIcon
+
+    tray_icon = QSystemTrayIcon(QIcon(_make_mushroom_icon()), app)
+    tray_icon.setToolTip("claudemeji (conductor)")
+
+    tray_menu = QMenu()
+    tray_menu.setStyleSheet("""
+        QMenu { background: #1c1c32; color: #e2e8f0; border: 1px solid #2a2a4a; }
+        QMenu::item:selected { background: #3730a3; }
+        QMenu::separator { background: #2a2a4a; height: 1px; }
+    """)
+
+    _visible = [True]
+    def toggle_all():
+        for slot in manager.slots.values():
+            if _visible[0]:
+                slot.player.hide()
+            else:
+                slot.player.show()
+        show_action.setText("Show all" if _visible[0] else "Hide all")
+        _visible[0] = not _visible[0]
+    show_action = tray_menu.addAction("Hide all", toggle_all)
+
+    tray_menu.addSeparator()
+
+    # sessions submenu (dynamic)
+    sessions_menu = tray_menu.addMenu("Sessions")
+    def refresh_sessions_menu():
+        sessions_menu.clear()
+        if not manager.slots:
+            sessions_menu.addAction("(no active sessions)").setEnabled(False)
+            return
+        for sid, slot in manager.slots.items():
+            label = f"{sid[:12]}..."
+            sub = sessions_menu.addMenu(label)
+            sub.addAction("Debug panel\u2026",
+                          lambda s=slot: _show_debug_panel(
+                              s.player, s.physics, s.restless,
+                              s._play, [s._current_posture],
+                              panel_id=s.session_id))
+            rest_sub = sub.addMenu("Restlessness")
+            for level in range(5):
+                rest_label = {0: "0 - Calm", 1: "1 - Fidgety", 2: "2 - Climby",
+                              3: "3 - Grabby", 4: "4 - Feral"}[level]
+                rest_sub.addAction(rest_label, lambda l=level, s=slot: s.restless._set_level(l))
+    sessions_menu.aboutToShow.connect(refresh_sessions_menu)
+
+    tray_menu.addSeparator()
+    tray_menu.addAction("Quit", app.quit)
+
+    tray_icon.setContextMenu(tray_menu)
+    tray_icon.activated.connect(lambda reason: toggle_all()
+                                if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+    tray_icon.show()
+    return tray_icon
+
+
+def _build_tray_single(app, slot):
+    """Build the system tray icon for single-session mode (backward compat)."""
+    from PyQt6.QtWidgets import QSystemTrayIcon, QMenu
+    from PyQt6.QtGui import QIcon
+
+    tray_icon = QSystemTrayIcon(QIcon(_make_mushroom_icon()), app)
+    tray_icon.setToolTip("claudemeji")
+
+    tray_menu = QMenu()
+    tray_menu.setStyleSheet("""
+        QMenu { background: #1c1c32; color: #e2e8f0; border: 1px solid #2a2a4a; }
+        QMenu::item:selected { background: #3730a3; }
+        QMenu::separator { background: #2a2a4a; height: 1px; }
+    """)
+
+    _visible = [True]
+    def toggle_visibility():
+        if _visible[0]:
+            slot.player.hide()
+            show_action.setText("Show")
+        else:
+            slot.player.show()
+            show_action.setText("Hide")
+        _visible[0] = not _visible[0]
+    show_action = tray_menu.addAction("Hide", toggle_visibility)
+
+    tray_menu.addAction("Debug panel\u2026",
+                        lambda: _show_debug_panel(slot.player, slot.physics, slot.restless,
+                                                  slot._play, [slot._current_posture],
+                                                  panel_id=slot.session_id))
+
+    tray_menu.addSeparator()
+
+    rest_menu = tray_menu.addMenu("Restlessness")
+    for level in range(5):
+        label = {0: "0 - Calm", 1: "1 - Fidgety", 2: "2 - Climby",
+                 3: "3 - Grabby", 4: "4 - Feral"}[level]
+        rest_menu.addAction(label, lambda l=level: slot.restless._set_level(l))
+
+    tray_menu.addSeparator()
+    tray_menu.addAction("Quit", app.quit)
+
+    tray_icon.setContextMenu(tray_menu)
+    tray_icon.activated.connect(lambda reason: toggle_visibility()
+                                if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+    tray_icon.show()
+    return tray_icon
 
 
 # --- main ---
 
 def main():
     parser = argparse.ArgumentParser(description="claudemeji desktop mascot")
-    parser.add_argument("--session", default=None, help="Claude Code session ID to follow")
+    parser.add_argument("--session", default=None, help="Claude Code session ID to follow (single-session mode)")
     parser.add_argument("--scale", type=float, default=1.0, help="Sprite scale factor (e.g. 0.5 for sub-Miku)")
     parser.add_argument("--solo", action="store_true", help="Run without event watching (subagent mode)")
     parser.add_argument("--x", type=int, default=None, help="Initial x position")
@@ -574,13 +631,6 @@ def main():
         sys.__excepthook__(exc_type, exc_value, exc_tb)
     sys.excepthook = _qt_exception_hook
 
-    # pid file for Stop hook
-    if args.session:
-        pid_dir = os.path.expanduser("~/.claudemeji/pids")
-        os.makedirs(pid_dir, exist_ok=True)
-        with open(os.path.join(pid_dir, f"{args.session}.pid"), "w") as f:
-            f.write(str(os.getpid()))
-
     config_path = os.environ.get("CLAUDEMEJI_CONFIG", None)
     try:
         config = load_config(config_path) if config_path else load_config()
@@ -588,394 +638,123 @@ def main():
         print(f"[claudemeji] {e}")
         config = None
 
-    # --- sprite player ---
-
-    player = SpritePlayer()
-    player.setWindowFlags(
-        Qt.WindowType.FramelessWindowHint
-        | Qt.WindowType.WindowStaysOnTopHint
-        | Qt.WindowType.WindowDoesNotAcceptFocus
-    )
-    player.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-
-    if args.scale != 1.0:
-        player.set_scale(args.scale)
-
-    if config:
-        try:
-            player.set_image_dir(config.pack.img_dir_path)
-            for name, action_def in config.actions.items():
-                player.register_action(name, action_def)
-            player.play(args.entry_action)
-        except FileNotFoundError as e:
-            print(f"[claudemeji] Could not load sprite pack: {e}")
-
-    screen = app.primaryScreen().availableGeometry()
-    init_x = args.x if args.x is not None else screen.width() - 148
-    init_y = args.y if args.y is not None else screen.height() - 148
-    player.move(init_x, init_y)
-    player.show()
-
-    # macOS window fixes (reapplied periodically — Qt resets them)
-    # only reapply when she's floating (otherwise it fights z-ordering)
-    _z_lowered = [False]  # mutable ref: True when layered with a non-top window
-
-    def _reapply_pin():
-        if not _z_lowered[0]:
-            apply_macos_window_fixes(player)
-
-    QTimer.singleShot(100, lambda: apply_macos_window_fixes(player))
-    _pin_timer = QTimer()
-    _pin_timer.setInterval(2000)
-    _pin_timer.timeout.connect(_reapply_pin)
-    _pin_timer.start()
-
-    # --- physics ---
-
-    physics = PhysicsEngine(window=player)
-
-    if config:
-        import claudemeji.physics as _physics_mod
-        _physics_mod.WINDOW_PULL_DISTANCE = config.physics.window_pull_distance
-        facing = config.physics.default_facing
-        player._native_facing = facing
-        player.set_facing(facing)
-        physics._facing = facing
-
-    # platform refresh
-    # protect our parent process (e.g. Terminal running us) from being minimized
-    _parent_pid = os.getppid()
-
-    def refresh_platforms():
-        if windows_available():
-            platforms = get_platform_tuples(own_pid=os.getpid())
-            # filter to windows that overlap miku's current screen,
-            # and exclude our parent process (don't toss our own terminal!)
-            screen = physics._screen_rect()
-            platforms = [p for p in platforms
-                         if p[0].intersects(screen) and p[1] != _parent_pid]
-            physics.update_platforms(platforms)
-        else:
-            physics.update_platforms([])
-
-    _platform_timer = QTimer()
-    _platform_timer.setInterval(2000)
-    _platform_timer.timeout.connect(refresh_platforms)
-    _platform_timer.start()
-    refresh_platforms()
-
-    # window interactions (all delegated to threaded AX calls)
-    physics.pull_window.connect(
-        lambda pid, rect, dy: _ax_threaded(_wrangler.move_window_by, pid, rect, 0, dy))
-    physics.window_move_to.connect(
-        lambda pid, x, y: _ax_threaded(_wrangler.move_window_to, pid, x, y))
-
-    def on_window_throw(pid, rect, direction):
-        print(f"[claudemeji] THROW window (pid={pid}, dir={direction})")
-        _ax_threaded(_wrangler.throw_and_minimize, pid, rect, physics._screen_rect(), direction)
-
-    physics.window_throw.connect(on_window_throw)
-    physics.window_toss_up.connect(
-        lambda pid, rect: _ax_threaded(_wrangler.toss_window_up, pid, rect))
-
-    # z-ordering: layer miku with the window she's interacting with
-    def on_z_context_changed(window_number, z_index):
-        if window_number == 0 or z_index < 0:
-            # float above everything
-            if _z_lowered[0]:
-                _z_lowered[0] = False
-                set_window_floating(player)
-                print("[claudemeji] z-order: floating (above all)")
-        else:
-            # layer with a specific window
-            _z_lowered[0] = True
-            set_window_above(player, window_number)
-            print(f"[claudemeji] z-order: above window #{window_number} (z={z_index})")
-
-    physics.z_context_changed.connect(on_z_context_changed)
-
-    # --- accessibility check ---
+    # --- accessibility check (once, shared) ---
 
     if _wrangler.is_available():
         if _wrangler.is_trusted():
-            print("[claudemeji] Accessibility permission: GRANTED ✓")
+            print("[claudemeji] Accessibility permission: GRANTED")
         else:
-            print("[claudemeji] ⚠ Accessibility permission NOT granted!")
+            print("[claudemeji] Accessibility permission NOT granted!")
             print("[claudemeji]   Window interactions (push, throw, wiggle) will be disabled.")
             print("[claudemeji]   Grant in: System Settings > Privacy & Security > Accessibility")
             _wrangler.request_trust()
     else:
         print("[claudemeji] Accessibility API not available (pyobjc-framework-ApplicationServices missing)")
 
-    # --- restlessness ---
+    # --- decide mode ---
 
-    restless = RestlessnessEngine()
+    use_conductor = not args.session and not args.solo
 
-    def on_restless_level(level):
-        physics.set_restlessness(level)
-        if level == 0:
-            print("[claudemeji] restlessness cleared — miku is calm")
+    if use_conductor:
+        # ============================================================
+        # CONDUCTOR MODE: manage multiple sessions in one process
+        # ============================================================
+        from claudemeji.conductor import MikuManager
+        from claudemeji.multi_watcher import MultiHookWatcher
 
-    restless.level_changed.connect(on_restless_level)
+        # write conductor pid so hooks know not to kill us
+        pid_dir = os.path.expanduser("~/.claudemeji/pids")
+        os.makedirs(pid_dir, exist_ok=True)
+        conductor_pid_path = os.path.join(pid_dir, "conductor.pid")
+        with open(conductor_pid_path, "w") as f:
+            f.write(str(os.getpid()))
 
-    def on_wrangle_window(level):
-        if args.solo:
-            return
-        try:
-            infos = get_window_infos(own_pid=os.getpid())
-            if not infos:
-                return
-            target = random.choice(infos)
-            screen_rect = physics._screen_rect()
-            # disabled: window chaos comes from miku's visible interactions only
-            pass
-            if not _wrangler.is_trusted() and _wrangler.is_available():
-                _wrangler.request_trust()
-        except Exception as e:
-            print(f"[claudemeji] wrangle setup error: {e}")
+        print("[claudemeji] starting in CONDUCTOR mode (multi-session)")
 
-    restless.wrangle_window.connect(on_wrangle_window)
-    restless.start()
+        manager = MikuManager(config, _ax_threaded)
+        multi_watcher = MultiHookWatcher()
 
-    # --- animation plumbing ---
+        # wire: watcher events → manager routing
+        multi_watcher.event_received.connect(manager.on_session_event)
+        multi_watcher.start()
 
-    _current_posture = ["standing"]
+        tray_icon = _build_tray_conductor(app, manager)
 
-    def _play(action: str, force: bool = False):
-        if action in ("sit_idle", "idle"):
-            action = _resolve_idle(config, restless.level)
-        resolved_name = config.resolve_action(action) if config else action
-        posture = _current_posture[0]
-        context = (_resolve_drag_context(config, restless.level)
-                   if action == "drag" else None)
-        player.play(resolved_name, posture=posture, context=context,
-                    force=(force or action in FORCE_ACTIONS))
-        resolved_def = player.current_def()
-        physics.set_action_walk_speed(resolved_def.walk_speed if resolved_def else 0.0)
-        physics.set_action_offset_y(resolved_def.offset_y if resolved_def else 0)
+        # clean up conductor pid on exit
+        def cleanup():
+            try:
+                os.unlink(conductor_pid_path)
+            except OSError:
+                pass
+            manager.destroy_all()
+            multi_watcher.stop()
 
-    def on_posture_changed(posture):
-        _current_posture[0] = posture
-        _play(player.current_action())
+        app.aboutToQuit.connect(cleanup)
 
-    physics.posture_changed.connect(on_posture_changed)
-    physics.facing_changed.connect(player.set_facing)
+    else:
+        # ============================================================
+        # SINGLE-SESSION / SOLO MODE: one MikuSlot, backward compat
+        # ============================================================
+        from claudemeji.slot import MikuSlot
+        from claudemeji.watcher import HookWatcher
 
-    # drag — direct _play calls for immediate mouse response, also clear oneshot lock
-    def on_drag_start(pos):
-        _oneshot_locked[0] = False
-        physics.on_drag_start(pos)
-        restless.notify_grabbed()
-        _play("drag")
+        # pid file for Stop hook (single-session)
+        if args.session:
+            pid_dir = os.path.expanduser("~/.claudemeji/pids")
+            os.makedirs(pid_dir, exist_ok=True)
+            with open(os.path.join(pid_dir, f"{args.session}.pid"), "w") as f:
+                f.write(str(os.getpid()))
 
-    def on_drag_release(pos):
-        _oneshot_locked[0] = False
-        physics.on_drag_release(pos)
-        _play("fall")
+        session_id = args.session or "solo"
 
-    player.drag_started.connect(on_drag_start)
-    player.drag_moved.connect(physics.on_drag_move)
-    player.drag_released.connect(on_drag_release)
-
-    # one-shot finished — clear the oneshot lock so creature state can drive animation again
-    def on_one_shot_finished():
-        _oneshot_locked[0] = False
-        if physics._event_locked:
-            _play(state_machine.state.action)
-        else:
-            # force re-evaluation: state may not have changed but we need to pick up
-            # the post-oneshot animation (e.g. stand/idle after landing)
-            state = physics._build_creature_state()
-            on_creature_state(state)
-
-    player.one_shot_finished.connect(on_one_shot_finished)
-
-    # creature state → animation
-    # physics emits creature state snapshots and discrete events;
-    # the resolver maps them to animation action names.
-    _oneshot_locked = [False]
-    _oneshot_posture = [None]  # posture when oneshot started — clear lock if posture changes
-
-    def on_creature_state(state):
-        if _oneshot_locked[0]:
-            # posture change overrides oneshot lock — physical state has fundamentally changed,
-            # the old one-shot animation (e.g. landing bounce) is no longer relevant
-            if state.posture != _oneshot_posture[0]:
-                _oneshot_locked[0] = False
-            else:
-                return
-        if state.is_event_locked:
-            return
-        action = resolve_animation(state)
-        if action in ("sit_idle", "idle", "stand"):
-            if state.posture.value == "sitting":
-                action = _resolve_idle(config, restless.level)
-            elif state.posture.value == "standing" and action == "sit_idle":
-                action = _resolve_idle(config, restless.level)
-        # skip if already playing this action (avoids restarting one-frame actions)
-        current = player.current_action()
-        if current == action:
-            return
-        # debug: catch standing-while-walking
-        if state.posture.value == "walking" and action in ("stand", "sit_idle"):
-            print(f"[claudemeji] BUG? posture=WALKING but action={action} "
-                  f"(speed={state.speed_tier.name}, locked={_oneshot_locked[0]})")
-        _play(action, force=True)
-
-    def on_creature_event(event):
-        action = resolve_animation(CreatureState(), event)
-        _play(action, force=True)
-        # only lock if the animation is actually non-looping —
-        # looping animations never fire one_shot_finished so the lock would stick forever
-        resolved_def = player.current_def()
-        if resolved_def and not resolved_def.loop:
-            _oneshot_locked[0] = True
-            _oneshot_posture[0] = physics._build_creature_state().posture
-
-    physics.creature_state_changed.connect(on_creature_state)
-    physics.creature_event.connect(on_creature_event)
-
-    physics.start()
-
-    # --- state machine + event lock ---
-
-    _event_unlock_timer = QTimer()
-    _event_unlock_timer.setSingleShot(True)
-    _event_unlock_timer.timeout.connect(physics.unlock)
-
-    state_machine = StateMachine(on_change=lambda state: on_state_change(state))
-
-    def on_state_change(state):
-        current = player.current_action()
-        if current in UNINTERRUPTABLE:
-            print(f"[claudemeji] event {state.action!r} deferred (currently {current!r})")
-            return
-        print(f"[claudemeji] event → {state.action} (posture: {_current_posture[0]})")
-        physics.lock_for_event()
-        _play(state.action)
-
-    # --- sub-miku tracking ---
-
-    _sub_mikus: list = []
-
-    def _spawn_sub_miku():
-        pos = player.pos()
-        env = os.environ.copy()
-        if config_path:
-            env["CLAUDEMEJI_CONFIG"] = config_path
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "claudemeji.main",
-             "--scale", "0.5", "--solo",
-             "--entry-action", "spawned",
-             "--x", str(pos.x() + (20 if len(_sub_mikus) % 2 == 0 else -20)),
-             "--y", str(pos.y())],
-            env=env,
+        slot = MikuSlot(
+            session_id=session_id,
+            config=config,
+            ax_threaded=_ax_threaded,
+            scale=args.scale,
+            solo=args.solo,
+            entry_action=args.entry_action,
+            init_x=args.x,
+            init_y=args.y,
         )
-        _sub_mikus.append(proc)
-        _sub_mikus[:] = [p for p in _sub_mikus if p.poll() is None]
 
-    def _dismiss_sub_miku():
-        if _sub_mikus:
-            _sub_mikus.pop().terminate()
+        # platform refresh for single-session mode (conductor does this itself)
+        _parent_pid = os.getppid()
 
-    # --- debug panel + context menu ---
+        def refresh_platforms():
+            if windows_available():
+                platforms = get_platform_tuples(own_pid=os.getpid())
+                screen = slot.physics._screen_rect()
+                platforms = [p for p in platforms
+                             if p[0].intersects(screen) and p[1] != _parent_pid]
+                slot.update_platforms(platforms)
+            else:
+                slot.update_platforms([])
 
-    player.add_context_action("Debug panel…",
-                              lambda: _show_debug_panel(player, physics, restless, _play, _current_posture))
+        _platform_timer = QTimer()
+        _platform_timer.setInterval(2000)
+        _platform_timer.timeout.connect(refresh_platforms)
+        _platform_timer.start()
+        refresh_platforms()
 
-    # --- system tray icon ---
+        tray_icon = _build_tray_single(app, slot)
 
-    from PyQt6.QtWidgets import QSystemTrayIcon, QMenu
-    from PyQt6.QtGui import QIcon
+        # --- solo mode: just physics, no event watching ---
+        if args.solo:
+            if args.entry_action == "spawned":
+                direction = 1 if (args.x or 0) >= 0 else -1
+                QTimer.singleShot(200, lambda: slot.physics.jump_burst(direction))
+            sys.exit(app.exec())
 
-    tray_icon = QSystemTrayIcon(QIcon(_make_mushroom_icon()), app)
-    tray_icon.setToolTip("claudemeji")
+        # --- hook watcher (single-session) ---
 
-    tray_menu = QMenu()
-    tray_menu.setStyleSheet("""
-        QMenu { background: #1c1c32; color: #e2e8f0; border: 1px solid #2a2a4a; }
-        QMenu::item:selected { background: #3730a3; }
-        QMenu::separator { background: #2a2a4a; height: 1px; }
-    """)
+        watcher = HookWatcher(session_id=args.session)
 
-    # show/hide
-    _visible = [True]
-    def toggle_visibility():
-        if _visible[0]:
-            player.hide()
-            show_action.setText("Show")
-        else:
-            player.show()
-            show_action.setText("Hide")
-        _visible[0] = not _visible[0]
-    show_action = tray_menu.addAction("Hide", toggle_visibility)
-
-    # debug panel
-    tray_menu.addAction("Debug panel…",
-                        lambda: _show_debug_panel(player, physics, restless, _play, _current_posture))
-
-    tray_menu.addSeparator()
-
-    # restlessness submenu
-    rest_menu = tray_menu.addMenu("Restlessness")
-    for level in range(5):
-        label = {0: "0 - Calm", 1: "1 - Fidgety", 2: "2 - Climby",
-                 3: "3 - Grabby", 4: "4 - Feral"}[level]
-        rest_menu.addAction(label, lambda l=level: restless._set_level(l))
-
-    tray_menu.addSeparator()
-    tray_menu.addAction("Quit", app.quit)
-
-    tray_icon.setContextMenu(tray_menu)
-    tray_icon.activated.connect(lambda reason: toggle_visibility()
-                                if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
-    tray_icon.show()
-
-    # --- solo mode (no event watching) ---
-
-    if args.solo:
-        if args.entry_action == "spawned":
-            direction = 1 if (args.x or 0) >= 0 else -1
-            QTimer.singleShot(200, lambda: physics.jump_burst(direction))
-        sys.exit(app.exec())
-
-    # --- hook watcher ---
-
-    watcher = HookWatcher(session_id=args.session)
-
-    def on_event_received(event):
-        etype = event.get("event_type", "")
-        tool_name = event.get("tool_name", "")
-        restless.notify_event()
-
-        if etype == "tool_end":
-            _event_unlock_timer.stop()
-            physics.unlock()
-
-        if etype == "tool_start" and tool_name in ("Agent", "Task"):
-            _spawn_sub_miku()
-        elif etype == "subagent_stop":
-            _dismiss_sub_miku()
-
-        state_machine.handle_event(event)
-
-        if etype == "tool_start":
-            _event_unlock_timer.start(TOOL_SAFETY_LOCK_MS)
-        elif etype != "tool_end":
-            _event_unlock_timer.start(REACTION_LOCK_MS)
-
-    watcher.event_received.connect(on_event_received)
-    watcher.idle_triggered.connect(physics.unlock)
-
-    def on_wait_triggered():
-        if state_machine.state.action == "bash":
-            return
-        state_machine.handle_event({"event_type": "tool_start", "tool_name": "_wait"})
-        _event_unlock_timer.start(TOOL_SAFETY_LOCK_MS)
-
-    watcher.wait_triggered.connect(on_wait_triggered)
-    watcher.wait_cleared.connect(lambda: (physics.unlock(), _play("stand")))
-    watcher.start()
+        watcher.event_received.connect(slot.handle_event)
+        watcher.idle_triggered.connect(slot.handle_idle)
+        watcher.wait_triggered.connect(slot.handle_wait_triggered)
+        watcher.wait_cleared.connect(slot.handle_wait_cleared)
+        watcher.start()
 
     sys.exit(app.exec())
 
