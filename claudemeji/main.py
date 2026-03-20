@@ -761,15 +761,21 @@ def main():
     physics.posture_changed.connect(on_posture_changed)
     physics.facing_changed.connect(player.set_facing)
 
-    # drag
+    # drag — direct _play calls for immediate mouse response, also clear oneshot lock
     def on_drag_start(pos):
+        _oneshot_locked[0] = False
         physics.on_drag_start(pos)
         restless.notify_grabbed()
         _play("drag")
 
+    def on_drag_release(pos):
+        _oneshot_locked[0] = False
+        physics.on_drag_release(pos)
+        _play("fall")
+
     player.drag_started.connect(on_drag_start)
     player.drag_moved.connect(physics.on_drag_move)
-    player.drag_released.connect(lambda pos: (physics.on_drag_release(pos), _play("fall")))
+    player.drag_released.connect(on_drag_release)
 
     # one-shot finished — clear the oneshot lock so creature state can drive animation again
     def on_one_shot_finished():
@@ -788,9 +794,17 @@ def main():
     # physics emits creature state snapshots and discrete events;
     # the resolver maps them to animation action names.
     _oneshot_locked = [False]
+    _oneshot_posture = [None]  # posture when oneshot started — clear lock if posture changes
 
     def on_creature_state(state):
-        if _oneshot_locked[0] or state.is_event_locked:
+        if _oneshot_locked[0]:
+            # posture change overrides oneshot lock — physical state has fundamentally changed,
+            # the old one-shot animation (e.g. landing bounce) is no longer relevant
+            if state.posture != _oneshot_posture[0]:
+                _oneshot_locked[0] = False
+            else:
+                return
+        if state.is_event_locked:
             return
         action = resolve_animation(state)
         if action in ("sit_idle", "idle", "stand"):
@@ -811,6 +825,7 @@ def main():
         resolved_def = player.current_def()
         if resolved_def and not resolved_def.loop:
             _oneshot_locked[0] = True
+            _oneshot_posture[0] = physics._build_creature_state().posture
 
     physics.creature_state_changed.connect(on_creature_state)
     physics.creature_event.connect(on_creature_event)

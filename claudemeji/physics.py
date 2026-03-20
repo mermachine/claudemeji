@@ -564,7 +564,21 @@ class PhysicsEngine(QObject):
         self._vel = Vec2()
         self._launched = False
         self._climb.ticks = random.randint(*self._climb_duration())
-        self._climb.pin_x = float(self._window.pos().x())
+        # pin to the wall edge with a fixed inset so she always grips at the same depth
+        miku_w = float(self._window.width())
+        inset = 65  # how far into the wall she overlaps
+        if window_info is not None:
+            wrect = _plat_rect(window_info)
+            if wall == PhysicsState.WALL_LEFT:
+                self._climb.pin_x = float(wrect.left()) - miku_w + inset
+            else:
+                self._climb.pin_x = float(wrect.right()) - inset
+        else:
+            screen = self._screen_rect()
+            if wall == PhysicsState.WALL_LEFT:
+                self._climb.pin_x = float(screen.left()) - inset
+            else:
+                self._climb.pin_x = float(screen.right()) - miku_w + inset
         self._climb.hanging = False
         self._climb.window = window_info
         self._climb.side_pull_counter = 0
@@ -659,12 +673,13 @@ class PhysicsEngine(QObject):
             landed_on_target = True
 
         if landed_on_target:
-            # snap to the correct corner for push/peek
+            # snap to window side: pressed against it, overlapping ~30px past midpoint
             if action in ("push", "peek", "throw", "side_toss"):
+                inset = miku_w * 0.5 + 30
                 if corner == "left":
-                    snap_x = float(fresh_rect.left()) - miku_w + 4
+                    snap_x = float(fresh_rect.left()) - miku_w + inset
                 else:
-                    snap_x = float(fresh_rect.right()) - 4
+                    snap_x = float(fresh_rect.right()) - inset
                 self._window.move(int(snap_x), int(floor_y))
             print(f"[claudemeji] pending: landed near target, firing {action}")
             if action == "push":
@@ -802,6 +817,14 @@ class PhysicsEngine(QObject):
     def start_window_push(self, window_rect: QRect, pid: int, corner: str):
         if self._state in (PhysicsState.DRAGGED, PhysicsState.FALLING):
             return
+        miku_w = float(self._window.width())
+        # snap to window side: pressed against it, overlapping ~30px past midpoint
+        inset = miku_w * 0.5 + 30
+        if corner == "left":
+            snap_x = float(window_rect.left()) - miku_w + inset
+        else:
+            snap_x = float(window_rect.right()) - inset
+        self._window.move(int(snap_x), self._window.pos().y())
         self._push = PushState(
             window=(window_rect, pid),
             corner=corner,
@@ -996,9 +1019,17 @@ class PhysicsEngine(QObject):
         elif self._state == PhysicsState.CARRYING_WINDOW:
             x, y = self._tick_carrying(x, y, bounds)
 
-        # safety clamp
-        x = max(float(left_x), min(x, float(right_x)))
-        y = max(float(ceil_y), min(y, screen_floor))
+        # safety clamp — extended bounds for climbing/ceiling so she grips the edge
+        EDGE_INSET = 65  # how far past the screen edge she can go when climbing
+        if self._state in (PhysicsState.WALL_LEFT, PhysicsState.WALL_RIGHT,
+                           PhysicsState.CEILING):
+            x = max(float(left_x) - EDGE_INSET, min(x, float(right_x) + EDGE_INSET))
+            # ceiling uses full screen top (above menu bar), walls use available geometry
+            y_min = float(QApplication.primaryScreen().geometry().top()) - EDGE_INSET if QApplication.primaryScreen() else float(ceil_y)
+            y = max(y_min, min(y, screen_floor))
+        else:
+            x = max(float(left_x), min(x, float(right_x)))
+            y = max(float(ceil_y), min(y, screen_floor))
 
         self._applied_offset_y = self._action_offset_y
         self._window.move(int(x + self._offset.x),
@@ -1327,7 +1358,12 @@ class PhysicsEngine(QObject):
 
     def _tick_ceiling(self, x, y, bounds):
         _, ceil_y, left_x, right_x = bounds
-        y = float(ceil_y)
+        # use full screen top (past menu bar) so she crawls at the actual top edge
+        screen = QApplication.screenAt(self._window.pos())
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        real_top = float(screen.geometry().top()) if screen else float(ceil_y)
+        y = real_top - 65  # nudge up past menu bar so she grips the true screen edge
 
         if self._climb.hanging:
             self._climb.ticks -= 1
@@ -1875,26 +1911,33 @@ class PhysicsEngine(QObject):
         return _find_platform_at(self._platforms, x, self._floor_y, miku_w, miku_h, screen_floor)
 
     def _nearby_window(self, max_dist: float = 200.0):
-        """Find a window near miku for interaction. Returns (corner, QRect, pid) or None.
-        Checks proximity to any edge of the window, not just corners."""
+        """Find a window near miku for side interaction (push/peek/throw).
+        Returns (corner, QRect, pid) or None.
+        Only returns windows whose side she can actually reach — her vertical
+        position must overlap with the window's vertical extent."""
         miku_w = float(self._window.width())
         miku_h = float(self._window.height())
         pos = self._window.pos()
         mx, my = float(pos.x()), float(pos.y())
         miku_cx = mx + miku_w / 2
-        miku_cy = my + miku_h / 2
+        miku_bottom = my + miku_h
 
         best = None
         best_dist = max_dist
 
         for plat in self._platforms:
             rect, pid = _plat_rect(plat), _plat_pid(plat)
-            # closest point on window rect to miku center
-            cx = max(float(rect.left()), min(miku_cx, float(rect.right())))
-            cy = max(float(rect.top()), min(miku_cy, float(rect.bottom())))
-            dist = ((miku_cx - cx) ** 2 + (miku_cy - cy) ** 2) ** 0.5
+            # vertical overlap check: miku's body must overlap the window's vertical range
+            # (she can't push/peek a window that's entirely above or below her)
+            win_top = float(rect.top())
+            win_bottom = float(rect.bottom())
+            if miku_bottom < win_top or my > win_bottom:
+                continue
+            # horizontal distance to nearest side edge
+            dist_left = abs(miku_cx - float(rect.left()))
+            dist_right = abs(miku_cx - float(rect.right()))
+            dist = min(dist_left, dist_right)
             if dist < best_dist:
-                # pick corner: which side is miku on?
                 corner = "left" if miku_cx < float(rect.left() + rect.right()) / 2 else "right"
                 best = (corner, rect, pid)
                 best_dist = dist
