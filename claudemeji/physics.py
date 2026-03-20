@@ -41,6 +41,16 @@ from PyQt6.QtWidgets import QApplication
 from claudemeji.creature import (
     CreatureState, CreatureEvent, Posture, SpeedTier, CarryPhase, ClimbSurface,
 )
+from claudemeji.surfaces import (
+    plat_rect as _plat_rect, plat_pid as _plat_pid,
+    plat_winnum as _plat_winnum, plat_zidx as _plat_zidx,
+    find_surface_below as _find_surface_below,
+    is_surface_occluded as _is_surface_occluded,
+    surface_at as _surface_at,
+    find_platform_at as _find_platform_at,
+    occlusion_wall_ahead as _occlusion_wall_ahead,
+    SURFACE_TOLERANCE,
+)
 
 
 # --- constants ---
@@ -54,7 +64,6 @@ SPRINT_SPEED = 8     # full dash at high restlessness
 IDLE_WANDER_INTERVAL = (180, 420)
 VELOCITY_HISTORY = 3     # fewer samples = snappier throw response
 SITTING_TIMEOUT = 300
-SURFACE_TOLERANCE = 4.0
 
 # wall climbing / ceiling crawling
 WALL_GRAB_CHANCE    = 0.35
@@ -265,116 +274,6 @@ def _weighted_choice(options: list[tuple[str, float]]) -> str:
             return name
     return options[-1][0]  # fallback
 
-
-# --- platform helpers ---
-#
-# Platforms are (QRect, pid, window_number, z_index) tuples, ordered front-to-back.
-# Helpers use _plat_* accessors for readability.
-
-def _plat_rect(p) -> QRect:   return p[0]
-def _plat_pid(p) -> int:      return p[1]
-def _plat_winnum(p) -> int:   return p[2] if len(p) > 2 else 0
-def _plat_zidx(p) -> int:     return p[3] if len(p) > 3 else 0
-
-
-def _find_surface_below(platforms, x: float, y_from: float, miku_w: float,
-                        miku_h: float, screen_floor: float,
-                        ignore_pid: int = 0,
-                        only_visible: bool = False) -> float:
-    """Highest surface at x that is at or below y_from.
-    ignore_pid: skip platforms owned by this pid (for drop-through).
-    only_visible: skip surfaces occluded by higher-z windows at x."""
-    best = screen_floor
-    for plat in platforms:
-        rect, pid = _plat_rect(plat), _plat_pid(plat)
-        if ignore_pid and pid == ignore_pid:
-            continue
-        if x + miku_w > rect.left() and x < rect.right():
-            surface = float(rect.top()) - miku_h
-            if surface >= y_from and surface < best:
-                if only_visible and _is_surface_occluded(platforms, plat, x, miku_w):
-                    continue
-                best = surface
-    return best
-
-
-def _is_surface_occluded(platforms, target_plat, x: float, miku_w: float) -> bool:
-    """Is the top surface of target_plat hidden by a higher-z window at x?
-    A surface is occluded if a window in front covers the same x range at the
-    target's top edge (meaning miku would be invisible standing there)."""
-    target_rect = _plat_rect(target_plat)
-    target_top = float(target_rect.top())
-    target_zidx = _plat_zidx(target_plat)
-    for plat in platforms:
-        if _plat_zidx(plat) >= target_zidx:
-            break  # reached target's depth — nothing in front left
-        rect = _plat_rect(plat)
-        # does this window cover the landing zone at the target's top?
-        if (rect.left() < x + miku_w and rect.right() > x
-                and rect.top() <= target_top and rect.bottom() > target_top):
-            return True
-    return False
-
-
-def _surface_at(platforms, x: float, floor_y: float, miku_w: float,
-                miku_h: float, screen_floor: float) -> bool:
-    """Is there a walkable surface at (x, floor_y)?"""
-    if abs(floor_y - screen_floor) < SURFACE_TOLERANCE:
-        return True
-    for plat in platforms:
-        rect = _plat_rect(plat)
-        if x + miku_w > rect.left() and x < rect.right():
-            surface = float(rect.top()) - miku_h
-            if abs(surface - floor_y) < SURFACE_TOLERANCE:
-                return True
-    return False
-
-
-def _find_platform_at(platforms, x: float, floor_y: float, miku_w: float,
-                      miku_h: float, screen_floor: float):
-    """Which platform is at floor_y? Returns full platform tuple or None."""
-    if abs(floor_y - screen_floor) < SURFACE_TOLERANCE:
-        return None
-    for plat in platforms:
-        rect = _plat_rect(plat)
-        if x + miku_w > rect.left() and x < rect.right():
-            surface = float(rect.top()) - miku_h
-            if abs(surface - floor_y) < SURFACE_TOLERANCE:
-                return plat
-    return None
-
-
-def _occlusion_wall_ahead(platforms, standing_plat, x: float, walk_dir: int,
-                          miku_w: float, miku_h: float) -> float | None:
-    """Find the x boundary where an occluding window blocks further travel.
-    Returns the x position of the soft wall, or None if the path is clear.
-    The wall is placed so miku peeks out by ~half her width."""
-    if standing_plat is None:
-        return None
-    standing_zidx = _plat_zidx(standing_plat)
-    standing_rect = _plat_rect(standing_plat)
-    standing_top = float(standing_rect.top())
-    # miku's body extends from standing_top - miku_h (head) to standing_top (feet)
-    miku_top = standing_top - miku_h
-    peek_amount = miku_w * 0.4  # how far she peeks out from behind the occluder
-
-    for plat in platforms:
-        if _plat_zidx(plat) >= standing_zidx:
-            break  # only check windows in front of what she's standing on
-        rect = _plat_rect(plat)
-        # does this window overlap vertically with miku's body?
-        if rect.bottom() <= miku_top or rect.top() >= standing_top:
-            continue
-        if walk_dir > 0:
-            wall_x = float(rect.left()) - miku_w + peek_amount
-            # return wall if ahead OR just passed (overshoot by up to SPRINT_SPEED)
-            if wall_x >= x - SPRINT_SPEED and wall_x < x + miku_w * 4:
-                return wall_x
-        elif walk_dir < 0:
-            wall_x = float(rect.right()) - peek_amount
-            if wall_x <= x + SPRINT_SPEED and wall_x > x - miku_w * 4:
-                return wall_x
-    return None
 
 
 # --- engine ---
@@ -1145,7 +1044,8 @@ class PhysicsEngine(QObject):
                                              miku_w, miku_h, screen_floor)
                 if standing is not None:
                     occ_wall = _occlusion_wall_ahead(self._platforms, standing, x,
-                                                     self._walk_dir, miku_w, miku_h)
+                                                     self._walk_dir, miku_w, miku_h,
+                                                     SPRINT_SPEED)
                     if occ_wall is not None:
                         # dynamically lower z-context as she approaches the occluder
                         if not self._is_topmost_platform(standing):

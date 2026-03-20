@@ -188,7 +188,7 @@ def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
                                  QFrame, QScrollArea, QWidget)
     from PyQt6.QtCore import Qt
     from PyQt6.QtGui import QFont
-    from claudemeji.physics import _plat_rect, _plat_pid, _plat_zidx
+    from claudemeji.surfaces import plat_rect as _plat_rect, plat_pid as _plat_pid, plat_zidx as _plat_zidx
 
     mono = QFont("Menlo, Monaco, Courier New")
     mono.setPointSize(11)
