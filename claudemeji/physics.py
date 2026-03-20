@@ -296,6 +296,8 @@ class PhysicsEngine(QObject):
         self._window = window
         self._vel = Vec2()
         self._state = PhysicsState.FALLING
+        self._fall_start_y = float(self._window.pos().y())
+        self._fall_distance = 0.0
         self._posture = PostureState.FALLING
         self._walk_dir = 0
         self._wander_ticks = 0
@@ -319,6 +321,8 @@ class PhysicsEngine(QObject):
         self._cursor_history: list[QPoint] = []
         self._thrown: bool = False           # True after high-velocity release (boosts wall grab)
         self._launched: bool = False         # True while falling upward after a jump
+        self._fall_start_y: float = 0.0     # y position when falling started
+        self._fall_distance: float = 0.0    # current fall distance (px, updated each tick)
 
         # grouped state
         self._climb = ClimbState()
@@ -432,6 +436,8 @@ class PhysicsEngine(QObject):
     def _start_falling(self):
         self._state = PhysicsState.FALLING
         self._speed_tier = SpeedTier.STILL
+        self._fall_start_y = float(self._window.pos().y())
+        self._fall_distance = 0.0
         self._set_posture(PostureState.FALLING)
 
     def _start_walking(self, direction: int, run: bool = False, sprint: bool = False):
@@ -513,7 +519,16 @@ class PhysicsEngine(QObject):
         self._speed_tier = SpeedTier.STILL
         self._set_posture(PostureState.STANDING)
         self._schedule_wander()
-        self._emit_creature_event(CreatureEvent.LANDED)
+        # emit landing event scaled to fall distance
+        from claudemeji.resolver import FALL_TINY, FALL_SOFT
+        dist = self._fall_distance
+        if dist > FALL_SOFT:
+            self._emit_creature_event(CreatureEvent.LANDED_HARD)
+        elif dist > FALL_TINY:
+            self._emit_creature_event(CreatureEvent.LANDED_SOFT)
+        else:
+            self._emit_creature_event(CreatureEvent.LANDED_TINY)
+        self._fall_distance = 0.0
         # check if we landed on a window (for weight-pulling + z-ordering)
         miku_w, miku_h = float(self._window.width()), float(self._window.height())
         x = float(self._window.pos().x())
@@ -632,6 +647,8 @@ class PhysicsEngine(QObject):
             return
         self._dragged = False
         self._state = PhysicsState.FALLING
+        self._fall_start_y = float(self._window.pos().y())
+        self._fall_distance = 0.0
         self._set_posture(PostureState.FALLING)
 
         if len(self._cursor_history) >= 2:
@@ -701,6 +718,8 @@ class PhysicsEngine(QObject):
             self._set_facing("right" if dir_x > 0 else "left")
         self._speed_tier = SpeedTier.STILL
         self._state = PhysicsState.FALLING
+        self._fall_start_y = float(self._window.pos().y())
+        self._fall_distance = 0.0
         self._set_posture(PostureState.FALLING)
         self._launched = True
 
@@ -709,6 +728,8 @@ class PhysicsEngine(QObject):
         self._vel.y = JUMP_IMPULSE_Y * 0.6
         self._set_facing("right" if direction > 0 else "left")
         self._state = PhysicsState.FALLING
+        self._fall_start_y = float(self._window.pos().y())
+        self._fall_distance = 0.0
         self._set_posture(PostureState.FALLING)
 
     # --- window interactions: push / peek / throw ---
@@ -867,6 +888,7 @@ class PhysicsEngine(QObject):
             carry_phase=self._carry_phase(),
             climb_surface=self._climb_surface(),
             launched=self._launched,
+            fall_distance=self._fall_distance,
             is_event_locked=self._event_locked,
             restlessness=self._restlessness,
         )
@@ -949,6 +971,10 @@ class PhysicsEngine(QObject):
         old_y = y
         x += self._vel.x
         y += self._vel.y
+
+        # track how far she's fallen (only counts downward distance)
+        current_y = float(self._window.pos().y())
+        self._fall_distance = max(0.0, current_y - self._fall_start_y)
 
         # keep facing consistent with horizontal movement during flight
         if abs(self._vel.x) > 0.5:
@@ -1113,6 +1139,8 @@ class PhysicsEngine(QObject):
                 self._set_facing("right" if direction > 0 else "left")
                 self._speed_tier = SpeedTier.STILL
                 self._state = PhysicsState.FALLING
+                self._fall_start_y = float(self._window.pos().y())
+                self._fall_distance = 0.0
                 self._set_posture(PostureState.FALLING)
                 self._launched = True
                 print(f"[claudemeji] bored on window, hopping off")
@@ -1140,6 +1168,8 @@ class PhysicsEngine(QObject):
                 self._set_facing("left" if self._walk_dir < 0 else "right")
                 self._speed_tier = SpeedTier.STILL
                 self._state = PhysicsState.FALLING
+                self._fall_start_y = float(self._window.pos().y())
+                self._fall_distance = 0.0
                 self._set_posture(PostureState.FALLING)
                 self._launched = True
             else:
@@ -1191,7 +1221,9 @@ class PhysicsEngine(QObject):
         screen_floor, ceil_y, left_x, right_x = bounds
         miku_w, miku_h = float(self._window.width()), float(self._window.height())
         x = self._climb.pin_x
-        on_screen_edge = (abs(x - left_x) < 2.0 or abs(x - right_x) < 2.0)
+        # account for climb inset: she's past the screen edge when climbing
+        CLIMB_INSET = 65
+        on_screen_edge = (x <= left_x + CLIMB_INSET or x >= right_x - CLIMB_INSET) and self._climb.window is None
 
         if self._climb.hanging:
             self._climb.ticks -= 1
@@ -1376,6 +1408,8 @@ class PhysicsEngine(QObject):
                 self._carry.reset()
                 self._vel.y = max(0, self._vel.y)  # keep falling naturally
                 self._state = PhysicsState.FALLING
+                self._fall_start_y = float(self._window.pos().y())
+                self._fall_distance = 0.0
                 self._set_posture(PostureState.FALLING)
                 return x, y
 
