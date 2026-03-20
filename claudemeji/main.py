@@ -813,8 +813,13 @@ def main():
             elif state.posture.value == "standing" and action == "sit_idle":
                 action = _resolve_idle(config, restless.level)
         # skip if already playing this action (avoids restarting one-frame actions)
-        if player.current_action() == action:
+        current = player.current_action()
+        if current == action:
             return
+        # debug: catch standing-while-walking
+        if state.posture.value == "walking" and action in ("stand", "sit_idle"):
+            print(f"[claudemeji] BUG? posture=WALKING but action={action} "
+                  f"(speed={state.speed_tier.name}, locked={_oneshot_locked[0]})")
         _play(action, force=True)
 
     def on_creature_event(event):

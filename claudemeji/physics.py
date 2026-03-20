@@ -421,9 +421,7 @@ class PhysicsEngine(QObject):
     def set_action_walk_speed(self, speed: float):
         self._action_walk_speed = speed
         if speed > 0 and self._state == PhysicsState.GROUNDED and self._walk_dir == 0:
-            self._walk_dir = random.choice([-1, 1])
-            self._set_facing("left" if self._walk_dir < 0 else "right")
-            self._set_posture(PostureState.WALKING)
+            self._start_walking(random.choice([-1, 1]))
 
     def set_action_offset_y(self, offset_y: int):
         self._action_offset_y = offset_y
@@ -1186,16 +1184,14 @@ class PhysicsEngine(QObject):
                 self._pull.reset()
                 self._start_wall_climb(PhysicsState.WALL_LEFT)
                 return x, True
-            self._walk_dir = 1
-            self._set_facing("right")
+            self._start_walking(1)
         elif x >= right_x:
             x = right_x
             if random.random() < grab_chance:
                 self._pull.reset()
                 self._start_wall_climb(PhysicsState.WALL_RIGHT)
                 return x, True
-            self._walk_dir = -1
-            self._set_facing("left")
+            self._start_walking(-1)
         return x, False
 
     def _tick_window_pull(self, y) -> float:
