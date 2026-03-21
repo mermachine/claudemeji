@@ -10,6 +10,10 @@ from claudemeji.creature import (
     CreatureState, CreatureEvent, Posture, SpeedTier, CarryPhase, ClimbSurface,
 )
 
+# fall distance thresholds (pixels)
+FALL_TINY = 40       # below this: no landing animation
+FALL_SOFT = 400      # below this: gentle landing; above: full dramatic tumble
+
 
 def resolve_animation(state: CreatureState, event: CreatureEvent | None = None) -> str:
     """Map creature state + optional discrete event to an animation action name.
@@ -19,7 +23,7 @@ def resolve_animation(state: CreatureState, event: CreatureEvent | None = None) 
     """
     # discrete events always win — they play as one-shots
     if event is not None:
-        return _EVENT_ANIMS[event]
+        return _EVENT_ANIMS.get(event, "stand")
 
     # carry has sub-phases that each need different animations
     if state.posture == Posture.CARRYING:
@@ -27,7 +31,8 @@ def resolve_animation(state: CreatureState, event: CreatureEvent | None = None) 
             return "window_carry"
         return _CARRY_PHASE_ANIMS.get(state.carry_phase, "window_carry")
 
-    # falling: jump pose while launched (upward velocity), fall pose otherwise
+    # falling: jump pose while launched (ascending), fall pose while descending.
+    # fall_distance only affects landing events, not in-flight animation.
     if state.posture == Posture.FALLING:
         return "jump" if state.launched else "fall"
 
@@ -48,7 +53,9 @@ def resolve_animation(state: CreatureState, event: CreatureEvent | None = None) 
 # --- mapping tables ---
 
 _EVENT_ANIMS = {
-    CreatureEvent.LANDED:        "land",
+    CreatureEvent.LANDED_HARD:   "land",
+    CreatureEvent.LANDED_SOFT:   "land_soft",
+    CreatureEvent.LANDED_TINY:   "stand",      # no animation, just resume
     CreatureEvent.TRIPPED:       "trip",
     CreatureEvent.THREW_WINDOW:  "window_throw",
     CreatureEvent.CARRY_CHEERED: "window_carry_cheer",

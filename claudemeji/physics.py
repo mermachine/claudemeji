@@ -41,6 +41,16 @@ from PyQt6.QtWidgets import QApplication
 from claudemeji.creature import (
     CreatureState, CreatureEvent, Posture, SpeedTier, CarryPhase, ClimbSurface,
 )
+from claudemeji.surfaces import (
+    plat_rect as _plat_rect, plat_pid as _plat_pid,
+    plat_winnum as _plat_winnum, plat_zidx as _plat_zidx,
+    find_surface_below as _find_surface_below,
+    is_surface_occluded as _is_surface_occluded,
+    surface_at as _surface_at,
+    find_platform_at as _find_platform_at,
+    occlusion_wall_ahead as _occlusion_wall_ahead,
+    SURFACE_TOLERANCE,
+)
 
 
 # --- constants ---
@@ -54,7 +64,6 @@ SPRINT_SPEED = 8     # full dash at high restlessness
 IDLE_WANDER_INTERVAL = (180, 420)
 VELOCITY_HISTORY = 3     # fewer samples = snappier throw response
 SITTING_TIMEOUT = 300
-SURFACE_TOLERANCE = 4.0
 
 # wall climbing / ceiling crawling
 WALL_GRAB_CHANCE    = 0.35
@@ -266,116 +275,6 @@ def _weighted_choice(options: list[tuple[str, float]]) -> str:
     return options[-1][0]  # fallback
 
 
-# --- platform helpers ---
-#
-# Platforms are (QRect, pid, window_number, z_index) tuples, ordered front-to-back.
-# Helpers use _plat_* accessors for readability.
-
-def _plat_rect(p) -> QRect:   return p[0]
-def _plat_pid(p) -> int:      return p[1]
-def _plat_winnum(p) -> int:   return p[2] if len(p) > 2 else 0
-def _plat_zidx(p) -> int:     return p[3] if len(p) > 3 else 0
-
-
-def _find_surface_below(platforms, x: float, y_from: float, miku_w: float,
-                        miku_h: float, screen_floor: float,
-                        ignore_pid: int = 0,
-                        only_visible: bool = False) -> float:
-    """Highest surface at x that is at or below y_from.
-    ignore_pid: skip platforms owned by this pid (for drop-through).
-    only_visible: skip surfaces occluded by higher-z windows at x."""
-    best = screen_floor
-    for plat in platforms:
-        rect, pid = _plat_rect(plat), _plat_pid(plat)
-        if ignore_pid and pid == ignore_pid:
-            continue
-        if x + miku_w > rect.left() and x < rect.right():
-            surface = float(rect.top()) - miku_h
-            if surface >= y_from and surface < best:
-                if only_visible and _is_surface_occluded(platforms, plat, x, miku_w):
-                    continue
-                best = surface
-    return best
-
-
-def _is_surface_occluded(platforms, target_plat, x: float, miku_w: float) -> bool:
-    """Is the top surface of target_plat hidden by a higher-z window at x?
-    A surface is occluded if a window in front covers the same x range at the
-    target's top edge (meaning miku would be invisible standing there)."""
-    target_rect = _plat_rect(target_plat)
-    target_top = float(target_rect.top())
-    target_zidx = _plat_zidx(target_plat)
-    for plat in platforms:
-        if _plat_zidx(plat) >= target_zidx:
-            break  # reached target's depth — nothing in front left
-        rect = _plat_rect(plat)
-        # does this window cover the landing zone at the target's top?
-        if (rect.left() < x + miku_w and rect.right() > x
-                and rect.top() <= target_top and rect.bottom() > target_top):
-            return True
-    return False
-
-
-def _surface_at(platforms, x: float, floor_y: float, miku_w: float,
-                miku_h: float, screen_floor: float) -> bool:
-    """Is there a walkable surface at (x, floor_y)?"""
-    if abs(floor_y - screen_floor) < SURFACE_TOLERANCE:
-        return True
-    for plat in platforms:
-        rect = _plat_rect(plat)
-        if x + miku_w > rect.left() and x < rect.right():
-            surface = float(rect.top()) - miku_h
-            if abs(surface - floor_y) < SURFACE_TOLERANCE:
-                return True
-    return False
-
-
-def _find_platform_at(platforms, x: float, floor_y: float, miku_w: float,
-                      miku_h: float, screen_floor: float):
-    """Which platform is at floor_y? Returns full platform tuple or None."""
-    if abs(floor_y - screen_floor) < SURFACE_TOLERANCE:
-        return None
-    for plat in platforms:
-        rect = _plat_rect(plat)
-        if x + miku_w > rect.left() and x < rect.right():
-            surface = float(rect.top()) - miku_h
-            if abs(surface - floor_y) < SURFACE_TOLERANCE:
-                return plat
-    return None
-
-
-def _occlusion_wall_ahead(platforms, standing_plat, x: float, walk_dir: int,
-                          miku_w: float, miku_h: float) -> float | None:
-    """Find the x boundary where an occluding window blocks further travel.
-    Returns the x position of the soft wall, or None if the path is clear.
-    The wall is placed so miku peeks out by ~half her width."""
-    if standing_plat is None:
-        return None
-    standing_zidx = _plat_zidx(standing_plat)
-    standing_rect = _plat_rect(standing_plat)
-    standing_top = float(standing_rect.top())
-    # miku's body extends from standing_top - miku_h (head) to standing_top (feet)
-    miku_top = standing_top - miku_h
-    peek_amount = miku_w * 0.4  # how far she peeks out from behind the occluder
-
-    for plat in platforms:
-        if _plat_zidx(plat) >= standing_zidx:
-            break  # only check windows in front of what she's standing on
-        rect = _plat_rect(plat)
-        # does this window overlap vertically with miku's body?
-        if rect.bottom() <= miku_top or rect.top() >= standing_top:
-            continue
-        if walk_dir > 0:
-            wall_x = float(rect.left()) - miku_w + peek_amount
-            # return wall if ahead OR just passed (overshoot by up to SPRINT_SPEED)
-            if wall_x >= x - SPRINT_SPEED and wall_x < x + miku_w * 4:
-                return wall_x
-        elif walk_dir < 0:
-            wall_x = float(rect.right()) - peek_amount
-            if wall_x <= x + SPRINT_SPEED and wall_x > x - miku_w * 4:
-                return wall_x
-    return None
-
 
 # --- engine ---
 
@@ -397,6 +296,8 @@ class PhysicsEngine(QObject):
         self._window = window
         self._vel = Vec2()
         self._state = PhysicsState.FALLING
+        self._fall_start_y = float(self._window.pos().y())
+        self._fall_distance = 0.0
         self._posture = PostureState.FALLING
         self._walk_dir = 0
         self._wander_ticks = 0
@@ -518,9 +419,7 @@ class PhysicsEngine(QObject):
     def set_action_walk_speed(self, speed: float):
         self._action_walk_speed = speed
         if speed > 0 and self._state == PhysicsState.GROUNDED and self._walk_dir == 0:
-            self._walk_dir = random.choice([-1, 1])
-            self._set_facing("left" if self._walk_dir < 0 else "right")
-            self._set_posture(PostureState.WALKING)
+            self._start_walking(random.choice([-1, 1]))
 
     def set_action_offset_y(self, offset_y: int):
         self._action_offset_y = offset_y
@@ -533,6 +432,8 @@ class PhysicsEngine(QObject):
     def _start_falling(self):
         self._state = PhysicsState.FALLING
         self._speed_tier = SpeedTier.STILL
+        self._fall_start_y = float(self._window.pos().y())
+        self._fall_distance = 0.0
         self._set_posture(PostureState.FALLING)
 
     def _start_walking(self, direction: int, run: bool = False, sprint: bool = False):
@@ -564,7 +465,21 @@ class PhysicsEngine(QObject):
         self._vel = Vec2()
         self._launched = False
         self._climb.ticks = random.randint(*self._climb_duration())
-        self._climb.pin_x = float(self._window.pos().x())
+        # pin to the wall edge with a fixed inset so she always grips at the same depth
+        miku_w = float(self._window.width())
+        inset = 65  # how far into the wall she overlaps
+        if window_info is not None:
+            wrect = _plat_rect(window_info)
+            if wall == PhysicsState.WALL_LEFT:
+                self._climb.pin_x = float(wrect.left()) - miku_w + inset
+            else:
+                self._climb.pin_x = float(wrect.right()) - inset
+        else:
+            screen = self._screen_rect()
+            if wall == PhysicsState.WALL_LEFT:
+                self._climb.pin_x = float(screen.left()) - inset
+            else:
+                self._climb.pin_x = float(screen.right()) - miku_w + inset
         self._climb.hanging = False
         self._climb.window = window_info
         self._climb.side_pull_counter = 0
@@ -600,7 +515,16 @@ class PhysicsEngine(QObject):
         self._speed_tier = SpeedTier.STILL
         self._set_posture(PostureState.STANDING)
         self._schedule_wander()
-        self._emit_creature_event(CreatureEvent.LANDED)
+        # emit landing event scaled to fall distance
+        from claudemeji.resolver import FALL_TINY, FALL_SOFT
+        dist = self._fall_distance
+        if dist > FALL_SOFT:
+            self._emit_creature_event(CreatureEvent.LANDED_HARD)
+        elif dist > FALL_TINY:
+            self._emit_creature_event(CreatureEvent.LANDED_SOFT)
+        else:
+            self._emit_creature_event(CreatureEvent.LANDED_TINY)
+        self._fall_distance = 0.0
         # check if we landed on a window (for weight-pulling + z-ordering)
         miku_w, miku_h = float(self._window.width()), float(self._window.height())
         x = float(self._window.pos().x())
@@ -659,12 +583,13 @@ class PhysicsEngine(QObject):
             landed_on_target = True
 
         if landed_on_target:
-            # snap to the correct corner for push/peek
+            # snap to window side: pressed against it, overlapping ~30px past midpoint
             if action in ("push", "peek", "throw", "side_toss"):
+                inset = miku_w * 0.5 + 30
                 if corner == "left":
-                    snap_x = float(fresh_rect.left()) - miku_w + 4
+                    snap_x = float(fresh_rect.left()) - miku_w + inset
                 else:
-                    snap_x = float(fresh_rect.right()) - 4
+                    snap_x = float(fresh_rect.right()) - inset
                 self._window.move(int(snap_x), int(floor_y))
             print(f"[claudemeji] pending: landed near target, firing {action}")
             if action == "push":
@@ -718,6 +643,8 @@ class PhysicsEngine(QObject):
             return
         self._dragged = False
         self._state = PhysicsState.FALLING
+        self._fall_start_y = float(self._window.pos().y())
+        self._fall_distance = 0.0
         self._set_posture(PostureState.FALLING)
 
         if len(self._cursor_history) >= 2:
@@ -787,6 +714,8 @@ class PhysicsEngine(QObject):
             self._set_facing("right" if dir_x > 0 else "left")
         self._speed_tier = SpeedTier.STILL
         self._state = PhysicsState.FALLING
+        self._fall_start_y = float(self._window.pos().y())
+        self._fall_distance = 0.0
         self._set_posture(PostureState.FALLING)
         self._launched = True
 
@@ -795,6 +724,8 @@ class PhysicsEngine(QObject):
         self._vel.y = JUMP_IMPULSE_Y * 0.6
         self._set_facing("right" if direction > 0 else "left")
         self._state = PhysicsState.FALLING
+        self._fall_start_y = float(self._window.pos().y())
+        self._fall_distance = 0.0
         self._set_posture(PostureState.FALLING)
 
     # --- window interactions: push / peek / throw ---
@@ -802,6 +733,14 @@ class PhysicsEngine(QObject):
     def start_window_push(self, window_rect: QRect, pid: int, corner: str):
         if self._state in (PhysicsState.DRAGGED, PhysicsState.FALLING):
             return
+        miku_w = float(self._window.width())
+        # snap to window side: pressed against it, overlapping ~30px past midpoint
+        inset = miku_w * 0.5 + 30
+        if corner == "left":
+            snap_x = float(window_rect.left()) - miku_w + inset
+        else:
+            snap_x = float(window_rect.right()) - inset
+        self._window.move(int(snap_x), self._window.pos().y())
         self._push = PushState(
             window=(window_rect, pid),
             corner=corner,
@@ -945,6 +884,7 @@ class PhysicsEngine(QObject):
             carry_phase=self._carry_phase(),
             climb_surface=self._climb_surface(),
             launched=self._launched,
+            fall_distance=self._fall_distance,
             is_event_locked=self._event_locked,
             restlessness=self._restlessness,
         )
@@ -996,9 +936,17 @@ class PhysicsEngine(QObject):
         elif self._state == PhysicsState.CARRYING_WINDOW:
             x, y = self._tick_carrying(x, y, bounds)
 
-        # safety clamp
-        x = max(float(left_x), min(x, float(right_x)))
-        y = max(float(ceil_y), min(y, screen_floor))
+        # safety clamp — extended bounds for climbing/ceiling so she grips the edge
+        EDGE_INSET = 65  # how far past the screen edge she can go when climbing
+        if self._state in (PhysicsState.WALL_LEFT, PhysicsState.WALL_RIGHT,
+                           PhysicsState.CEILING):
+            x = max(float(left_x) - EDGE_INSET, min(x, float(right_x) + EDGE_INSET))
+            # ceiling uses full screen top (above menu bar), walls use available geometry
+            y_min = float(QApplication.primaryScreen().geometry().top()) - EDGE_INSET if QApplication.primaryScreen() else float(ceil_y)
+            y = max(y_min, min(y, screen_floor))
+        else:
+            x = max(float(left_x), min(x, float(right_x)))
+            y = max(float(ceil_y), min(y, screen_floor))
 
         self._applied_offset_y = self._action_offset_y
         self._window.move(int(x + self._offset.x),
@@ -1019,6 +967,10 @@ class PhysicsEngine(QObject):
         old_y = y
         x += self._vel.x
         y += self._vel.y
+
+        # track how far she's fallen (only counts downward distance)
+        current_y = float(self._window.pos().y())
+        self._fall_distance = max(0.0, current_y - self._fall_start_y)
 
         # keep facing consistent with horizontal movement during flight
         if abs(self._vel.x) > 0.5:
@@ -1114,7 +1066,8 @@ class PhysicsEngine(QObject):
                                              miku_w, miku_h, screen_floor)
                 if standing is not None:
                     occ_wall = _occlusion_wall_ahead(self._platforms, standing, x,
-                                                     self._walk_dir, miku_w, miku_h)
+                                                     self._walk_dir, miku_w, miku_h,
+                                                     SPRINT_SPEED)
                     if occ_wall is not None:
                         # dynamically lower z-context as she approaches the occluder
                         if not self._is_topmost_platform(standing):
@@ -1182,6 +1135,8 @@ class PhysicsEngine(QObject):
                 self._set_facing("right" if direction > 0 else "left")
                 self._speed_tier = SpeedTier.STILL
                 self._state = PhysicsState.FALLING
+                self._fall_start_y = float(self._window.pos().y())
+                self._fall_distance = 0.0
                 self._set_posture(PostureState.FALLING)
                 self._launched = True
                 print(f"[claudemeji] bored on window, hopping off")
@@ -1209,6 +1164,8 @@ class PhysicsEngine(QObject):
                 self._set_facing("left" if self._walk_dir < 0 else "right")
                 self._speed_tier = SpeedTier.STILL
                 self._state = PhysicsState.FALLING
+                self._fall_start_y = float(self._window.pos().y())
+                self._fall_distance = 0.0
                 self._set_posture(PostureState.FALLING)
                 self._launched = True
             else:
@@ -1225,16 +1182,14 @@ class PhysicsEngine(QObject):
                 self._pull.reset()
                 self._start_wall_climb(PhysicsState.WALL_LEFT)
                 return x, True
-            self._walk_dir = 1
-            self._set_facing("right")
+            self._start_walking(1)
         elif x >= right_x:
             x = right_x
             if random.random() < grab_chance:
                 self._pull.reset()
                 self._start_wall_climb(PhysicsState.WALL_RIGHT)
                 return x, True
-            self._walk_dir = -1
-            self._set_facing("left")
+            self._start_walking(-1)
         return x, False
 
     def _tick_window_pull(self, y) -> float:
@@ -1260,7 +1215,9 @@ class PhysicsEngine(QObject):
         screen_floor, ceil_y, left_x, right_x = bounds
         miku_w, miku_h = float(self._window.width()), float(self._window.height())
         x = self._climb.pin_x
-        on_screen_edge = (abs(x - left_x) < 2.0 or abs(x - right_x) < 2.0)
+        # account for climb inset: she's past the screen edge when climbing
+        CLIMB_INSET = 65
+        on_screen_edge = (x <= left_x + CLIMB_INSET or x >= right_x - CLIMB_INSET) and self._climb.window is None
 
         if self._climb.hanging:
             self._climb.ticks -= 1
@@ -1327,7 +1284,12 @@ class PhysicsEngine(QObject):
 
     def _tick_ceiling(self, x, y, bounds):
         _, ceil_y, left_x, right_x = bounds
-        y = float(ceil_y)
+        # use full screen top (past menu bar) so she crawls at the actual top edge
+        screen = QApplication.screenAt(self._window.pos())
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        real_top = float(screen.geometry().top()) if screen else float(ceil_y)
+        y = real_top - 65  # nudge up past menu bar so she grips the true screen edge
 
         if self._climb.hanging:
             self._climb.ticks -= 1
@@ -1440,6 +1402,8 @@ class PhysicsEngine(QObject):
                 self._carry.reset()
                 self._vel.y = max(0, self._vel.y)  # keep falling naturally
                 self._state = PhysicsState.FALLING
+                self._fall_start_y = float(self._window.pos().y())
+                self._fall_distance = 0.0
                 self._set_posture(PostureState.FALLING)
                 return x, y
 
@@ -1875,26 +1839,33 @@ class PhysicsEngine(QObject):
         return _find_platform_at(self._platforms, x, self._floor_y, miku_w, miku_h, screen_floor)
 
     def _nearby_window(self, max_dist: float = 200.0):
-        """Find a window near miku for interaction. Returns (corner, QRect, pid) or None.
-        Checks proximity to any edge of the window, not just corners."""
+        """Find a window near miku for side interaction (push/peek/throw).
+        Returns (corner, QRect, pid) or None.
+        Only returns windows whose side she can actually reach — her vertical
+        position must overlap with the window's vertical extent."""
         miku_w = float(self._window.width())
         miku_h = float(self._window.height())
         pos = self._window.pos()
         mx, my = float(pos.x()), float(pos.y())
         miku_cx = mx + miku_w / 2
-        miku_cy = my + miku_h / 2
+        miku_bottom = my + miku_h
 
         best = None
         best_dist = max_dist
 
         for plat in self._platforms:
             rect, pid = _plat_rect(plat), _plat_pid(plat)
-            # closest point on window rect to miku center
-            cx = max(float(rect.left()), min(miku_cx, float(rect.right())))
-            cy = max(float(rect.top()), min(miku_cy, float(rect.bottom())))
-            dist = ((miku_cx - cx) ** 2 + (miku_cy - cy) ** 2) ** 0.5
+            # vertical overlap check: miku's body must overlap the window's vertical range
+            # (she can't push/peek a window that's entirely above or below her)
+            win_top = float(rect.top())
+            win_bottom = float(rect.bottom())
+            if miku_bottom < win_top or my > win_bottom:
+                continue
+            # horizontal distance to nearest side edge
+            dist_left = abs(miku_cx - float(rect.left()))
+            dist_right = abs(miku_cx - float(rect.right()))
+            dist = min(dist_left, dist_right)
             if dist < best_dist:
-                # pick corner: which side is miku on?
                 corner = "left" if miku_cx < float(rect.left() + rect.right()) / 2 else "right"
                 best = (corner, rect, pid)
                 best_dist = dist

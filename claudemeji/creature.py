@@ -58,7 +58,9 @@ class ClimbSurface(Enum):
 class CreatureEvent(Enum):
     """Discrete events that play one-shot animations.
     Emitted once at the moment something happens; animation locks until it finishes."""
-    LANDED        = auto()   # fall → ground (bounce)
+    LANDED_HARD   = auto()   # big fall → full tumble bounce
+    LANDED_SOFT   = auto()   # medium fall → gentle stumble
+    LANDED_TINY   = auto()   # tiny hop → no animation needed, just resume
     TRIPPED       = auto()   # stumbled during movement
     THREW_WINDOW  = auto()   # standing throw gesture
     CARRY_CHEERED = auto()   # celebration after carry-throw
@@ -75,5 +77,6 @@ class CreatureState:
     carry_phase: CarryPhase = CarryPhase.NONE
     climb_surface: ClimbSurface = ClimbSurface.NONE
     launched: bool = False       # True while falling upward after a jump (show jump pose, not fall)
+    fall_distance: float = 0.0   # how far she's fallen so far (px) — resolver uses for jump/fall pose
     is_event_locked: bool = False
     restlessness: int = 0
