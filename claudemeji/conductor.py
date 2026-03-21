@@ -50,13 +50,13 @@ class MikuManager(QObject):
         """Route an event to the right slot, creating on session_start."""
         etype = event.get("event_type", "")
 
-        # only create slots on explicit session_start — not on random mid-stream events
-        # from stale session files
+        # create slot on first event from any session — not just session_start.
+        # the multi_watcher already filters out stale files (>5min old), so any
+        # event we receive is from a live session worth tracking.
         if session_id not in self._slots:
-            if etype == "session_start":
-                self._create_slot(session_id)
-            else:
-                return
+            if etype == "session_stop":
+                return  # don't create a slot just to immediately destroy it
+            self._create_slot(session_id)
 
         slot = self._slots.get(session_id)
         if not slot:
