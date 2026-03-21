@@ -546,6 +546,13 @@ def _build_tray_conductor(app, manager):
                 rest_label = {0: "0 - Calm", 1: "1 - Fidgety", 2: "2 - Climby",
                               3: "3 - Grabby", 4: "4 - Feral"}[level]
                 rest_sub.addAction(rest_label, lambda l=level, s=slot: s.restless._set_level(l))
+            sub.addSeparator()
+            if slot.player.isVisible():
+                sub.addAction("Pause", lambda s=slot: s.player.hide())
+            else:
+                sub.addAction("Resume", lambda s=slot: s.player.show())
+            sub.addAction("Stop", lambda s=slot, sid=sid: (
+                manager.force_destroy(sid)))
     sessions_menu.aboutToShow.connect(refresh_sessions_menu)
 
     tray_menu.addSeparator()

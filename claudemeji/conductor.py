@@ -85,6 +85,10 @@ class MikuManager(QObject):
         for sid in list(self._slots.keys()):
             self._destroy_slot(sid)
 
+    def force_destroy(self, session_id: str):
+        """Manually destroy a slot (from tray menu). Future events can recreate it."""
+        self._destroy_slot(session_id)
+
     # --- internal ---
 
     def _create_slot(self, session_id: str):
