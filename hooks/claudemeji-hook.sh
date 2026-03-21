@@ -30,7 +30,13 @@ case "$EVENT" in
       "$LAUNCHER" "$SESSION_ID" &
     fi
     ;;
-  Stop|SessionEnd)
+  Stop)
+    # Stop fires on every response turn — NOT session end.
+    # In conductor mode we don't want this to kill miku.
+    # Just record it as a pause, not a session_stop.
+    echo "$INPUT" | jq -c "{event_type: \"stop\", session_id: .session_id, ts: $TS}" >> "$EVENTS_FILE"
+    ;;
+  SessionEnd)
     echo "$INPUT" | jq -c "{event_type: \"session_stop\", session_id: .session_id, ts: $TS}" >> "$EVENTS_FILE"
     # kill claudemeji for this session if a pid file exists
     PID_FILE="$HOME/.claudemeji/pids/$SESSION_ID.pid"

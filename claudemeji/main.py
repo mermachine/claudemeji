@@ -662,10 +662,23 @@ def main():
         from claudemeji.conductor import MikuManager
         from claudemeji.multi_watcher import MultiHookWatcher
 
-        # write conductor pid so hooks know not to kill us
+        # ensure only one conductor runs at a time
         pid_dir = os.path.expanduser("~/.claudemeji/pids")
         os.makedirs(pid_dir, exist_ok=True)
         conductor_pid_path = os.path.join(pid_dir, "conductor.pid")
+        if os.path.exists(conductor_pid_path):
+            try:
+                old_pid = int(open(conductor_pid_path).read().strip())
+                # check if that process is actually alive
+                os.kill(old_pid, 0)  # signal 0 = existence check, doesn't kill
+                print(f"[claudemeji] conductor already running (pid {old_pid}), exiting")
+                sys.exit(0)
+            except (ProcessLookupError, ValueError):
+                pass  # stale pid file, take over
+            except PermissionError:
+                # process exists but we can't signal it — still alive
+                print(f"[claudemeji] conductor already running (pid {old_pid}), exiting")
+                sys.exit(0)
         with open(conductor_pid_path, "w") as f:
             f.write(str(os.getpid()))
 
