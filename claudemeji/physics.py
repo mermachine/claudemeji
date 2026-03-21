@@ -321,8 +321,6 @@ class PhysicsEngine(QObject):
         self._cursor_history: list[QPoint] = []
         self._thrown: bool = False           # True after high-velocity release (boosts wall grab)
         self._launched: bool = False         # True while falling upward after a jump
-        self._fall_start_y: float = 0.0     # y position when falling started
-        self._fall_distance: float = 0.0    # current fall distance (px, updated each tick)
 
         # grouped state
         self._climb = ClimbState()

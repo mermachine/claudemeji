@@ -207,7 +207,7 @@ class MikuSlot:
 
         # --- animation plumbing ---
 
-        self._current_posture = "standing"
+        self._current_posture = ["standing"]  # mutable ref — debug panel reads [0] on refresh
         self._oneshot_locked = False
         self._oneshot_posture = None  # posture when oneshot started — clear lock if posture changes
 
@@ -215,7 +215,7 @@ class MikuSlot:
             if action in ("sit_idle", "idle"):
                 action = _resolve_idle(config, self.restless.level)
             resolved_name = config.resolve_action(action) if config else action
-            posture = self._current_posture
+            posture = self._current_posture[0]
             context = (_resolve_drag_context(config, self.restless.level)
                        if action == "drag" else None)
             self.player.play(resolved_name, posture=posture, context=context,
@@ -227,7 +227,7 @@ class MikuSlot:
         self._play = _play
 
         def on_posture_changed(posture):
-            self._current_posture = posture
+            self._current_posture[0] = posture
             _play(self.player.current_action())
 
         self.physics.posture_changed.connect(on_posture_changed)
@@ -390,7 +390,7 @@ class MikuSlot:
         if current in UNINTERRUPTABLE:
             print(f"[claudemeji:{self.session_id}] event {state.action!r} deferred (currently {current!r})")
             return
-        print(f"[claudemeji:{self.session_id}] event \u2192 {state.action} (posture: {self._current_posture})")
+        print(f"[claudemeji:{self.session_id}] event \u2192 {state.action} (posture: {self._current_posture[0]})")
         self.physics.lock_for_event()
         self._play(state.action)
 
@@ -427,6 +427,6 @@ class MikuSlot:
         from claudemeji.main import _show_debug_panel
         _show_debug_panel(
             self.player, self.physics, self.restless,
-            self._play, [self._current_posture],
+            self._play, self._current_posture,
             panel_id=self.session_id,
         )

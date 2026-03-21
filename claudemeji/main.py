@@ -539,7 +539,7 @@ def _build_tray_conductor(app, manager):
             sub.addAction("Debug panel\u2026",
                           lambda s=slot: _show_debug_panel(
                               s.player, s.physics, s.restless,
-                              s._play, [s._current_posture],
+                              s._play, s._current_posture,
                               panel_id=s.session_id))
             rest_sub = sub.addMenu("Restlessness")
             for level in range(5):
@@ -586,7 +586,7 @@ def _build_tray_single(app, slot):
 
     tray_menu.addAction("Debug panel\u2026",
                         lambda: _show_debug_panel(slot.player, slot.physics, slot.restless,
-                                                  slot._play, [slot._current_posture],
+                                                  slot._play, slot._current_posture,
                                                   panel_id=slot.session_id))
 
     tray_menu.addSeparator()
