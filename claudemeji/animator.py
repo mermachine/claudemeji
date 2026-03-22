@@ -86,7 +86,6 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "subagent":      "Parent split animation — spawning a subagent (Agent/Task tools)",
     "spawned":       "Subagent entrance — jump up from parent, fall down",
     "window_push":        "Pushing/dragging a window (restlessness >= 2)",
-    "window_peek":        "Peeking from a window corner (restlessness >= 2)",
     "window_throw":       "Throwing a window — arc + minimize (restlessness >= 4)",
     "window_carry":       "Walking with a grabbed window",
     "window_carry_perch": "Perched on window corner before grabbing",
@@ -104,7 +103,6 @@ ACTION_POSTURES: dict[str, list[str]] = {
     "wait":       ["sitting"],
     "react_good": ["sitting"],
     "window_push": ["hanging", "climbing"],
-    "window_peek": ["hanging", "climbing"],
 }
 
 # Context variants available per action (drag context = restlessness tier)

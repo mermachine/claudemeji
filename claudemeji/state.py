@@ -41,7 +41,6 @@ ACTIONS = [
     "spawned",      # subagent entrance animation (jump up from parent, fall down)
     # window interactions (restlessness-gated)
     "window_push",       # pushing/dragging a window
-    "window_peek",       # peeking from a window corner
     "window_throw",      # throwing a window (arc + minimize)
     "window_carry",      # walking with a grabbed window
     "window_carry_perch",# perched on window corner before grabbing

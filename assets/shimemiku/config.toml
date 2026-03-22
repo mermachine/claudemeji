@@ -197,11 +197,6 @@ files = ["shime36b.png", "shime34b.png", "shime35b.png", "shime34b.png"]
 fps = 3
 loop = true
 
-[actions.window_peek]
-files = ["shime36.png"]
-fps = 1
-loop = false
-
 [actions.window_throw]
 intro_files = ["shime34b.png"]
 files = ["shime34b.png", "shime37.png"]

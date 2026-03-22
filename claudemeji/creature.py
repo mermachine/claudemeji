@@ -22,7 +22,6 @@ class Posture(Enum):
     DRAGGED  = "dragged"
     HANGING  = "hanging"
     PUSHING  = "pushing"
-    PEEKING  = "peeking"
     CARRYING = "carrying"
 
 
