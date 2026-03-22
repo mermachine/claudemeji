@@ -1,87 +1,57 @@
 # claudemeji
 
-a desktop mascot that watches what claude code is doing and reacts with animations.
-powered by PyQt6. works on macOS and Windows (linux untested but probably fine).
+a desktop mascot that reacts to claude code in real time. she walks on your windows, climbs walls, chases your cursor, and throws your windows when you ignore her.
+
+macOS only. powered by PyQt6 + claude code hooks.
+
+## install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mermachine/claudemeji/main/install.sh | bash
+```
+
+this clones the repo, installs dependencies, wires up claude code hooks, and configures the bundled shimemiku sprite pack. grant Accessibility permission (System Settings > Privacy & Security > Accessibility) for window interactions.
 
 ## how it works
 
-1. **claude code hooks** write events to `~/.claudemeji/events.jsonl` as JSON lines
-2. **claudemeji** watches that file and maps tool calls to animation states
-3. your shimeji sprite pack plays the matching animation
+claude code hooks write per-session events to `~/.claudemeji/events/`. the **conductor** watches that directory and spawns one miku per active session — each with independent physics, animation, and restlessness. sub-mikus spawn in-process when claude uses Agent/Task tools.
 
-## setup
+## what she does
 
-### 1. install
-
-```bash
-pip install PyQt6
-# python 3.10 or earlier also needs:
-pip install tomli
-```
-
-### 2. configure a sprite pack
-
-```bash
-mkdir -p ~/.claudemeji
-cp config.example.toml ~/.claudemeji/config.toml
-# edit config.toml to point at your sprite pack and define frame ranges
-```
-
-### 3. install the hooks
-
-add to your claude code settings (`~/.claude/settings.json`):
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "",
-        "hooks": [{"type": "command", "command": "/path/to/claudemeji/hooks/pre_tool.sh"}]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "",
-        "hooks": [{"type": "command", "command": "/path/to/claudemeji/hooks/post_tool.sh"}]
-      }
-    ]
-  }
-}
-```
-
-### 4. run
-
-```bash
-python -m claudemeji.main
-```
-
-## action set
-
-| action | trigger |
+| | |
 |---|---|
-| `sit_idle` | between events, idle timeout |
-| `think` | Agent/Task tool, processing |
-| `read` | Read, Grep, Glob, WebSearch |
-| `type` | Edit, Write |
-| `run` | Bash |
-| `wait` | long-running process |
-| `react_good` | successful tool completion |
-| `react_bad` | error, denied tool call |
-| `walk_left` / `walk_right` | physics / movement |
-| `fall` | physics |
-| `climb` | physics (optional) |
-| `drag` | mouse interaction |
+| **reacts to tools** | different animations for bash, read, write, think, plan |
+| **walks on windows** | treats your window title bars as platforms |
+| **climbs walls** | screen edges and window sides, with ceiling crawling |
+| **gets restless** | escalates from calm → fidgety → climby → grabby → feral |
+| **chases your cursor** | at restlessness 2+, she starts following you |
+| **pushes/peeks/throws windows** | at high restlessness, she interacts with your windows |
+| **carries windows** | jumps to a window corner and walks off with it |
+| **reacts to drag** | calm when grabbed at low restlessness, angry when feral |
+| **z-orders correctly** | goes behind windows above the one she's standing on |
 
-## using existing shimeji packs
+## running manually
 
-shimeji packs aren't required to have all our actions. use `[action_aliases]` in your
-config to map our canonical names to whatever animation fits. any unmapped action
-falls back to `sit_idle`.
+```bash
+# conductor mode (default) — manages all sessions
+/usr/bin/python3 -u -m claudemeji.main
 
-## sprite pack format
+# single session
+/usr/bin/python3 -u -m claudemeji.main --session SESSION_ID
 
-we expect a single PNG spritesheet (vertical strip by default).
-set `frame_width` and `frame_height` in the config, then define frame indices
-per action. grids work too - set appropriate dimensions and the frame indices
-will be read left-to-right, top-to-bottom.
+# solo mode (no events, just wanders)
+/usr/bin/python3 -u -m claudemeji.main --solo
+```
+
+## configuring animations
+
+```bash
+# GUI editor for sprite pack config
+python3 -m claudemeji.animator
+```
+
+config lives at `~/.claudemeji/config.toml`. sprite packs are individual PNGs referenced by filename. use `[action_aliases]` to map action names if your pack doesn't have all animations — unmapped actions fall back to `sit_idle`.
+
+## sprite pack
+
+ships with **shimemiku** (Hatsune Miku) by [canarypop](https://kilakila.jp/shimeji/). 61 sprites covering standing, walking, running, sitting, climbing, falling, dragging, and all the window interaction poses.
