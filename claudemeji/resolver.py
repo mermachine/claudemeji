@@ -86,6 +86,5 @@ _POSTURE_ANIMS = {
     Posture.DRAGGED:  "drag",
     Posture.HANGING:  "hang",
     Posture.PUSHING:  "window_push",
-    Posture.PEEKING:  "window_peek",
     Posture.CARRYING: "window_carry",
 }
