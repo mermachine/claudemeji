@@ -150,3 +150,9 @@ class MikuManager(QObject):
             screen = slot.physics._screen_rect()
             filtered = [p for p in platforms if p[0].intersects(screen)]
             slot.update_platforms(filtered)
+            # also push to sub-mikus so they can walk on windows
+            for sub in slot._sub_mikus:
+                if not sub._destroyed:
+                    sub_screen = sub.physics._screen_rect()
+                    sub_filtered = [p for p in platforms if p[0].intersects(sub_screen)]
+                    sub.update_platforms(sub_filtered)

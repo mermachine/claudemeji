@@ -83,9 +83,11 @@ class MikuSlot:
         entry_action: str = "stand",
         init_x: int | None = None,
         init_y: int | None = None,
+        is_sub: bool = False,
     ):
         self.session_id = session_id
         self.solo = solo
+        self.is_sub = is_sub  # sub-mikus: no restlessness, smaller scale
         self._config = config
         self._ax_threaded = ax_threaded
         self._destroyed = False
@@ -93,6 +95,8 @@ class MikuSlot:
         # --- sub-miku tracking (in-process slots instead of subprocess) ---
         self._sub_mikus: list[MikuSlot] = []
         self._sub_counter = 0
+        # active subagent tool_use_ids — events nested inside these are forwarded to sub-mikus
+        self._active_subagent_ids: list[str] = []  # stack: most recent = last
 
         # --- sprite player ---
 
@@ -203,7 +207,9 @@ class MikuSlot:
                 print(f"[claudemeji:{session_id}] wrangle setup error: {e}")
 
         self.restless.wrangle_window.connect(on_wrangle_window)
-        self.restless.start()
+        if not is_sub:
+            self.restless.start()
+        # sub-mikus stay calm — restlessness pinned at 0
 
         # --- animation plumbing ---
 
@@ -314,12 +320,18 @@ class MikuSlot:
     # --- public API ---
 
     def handle_event(self, event: dict):
-        """Process a hook event for this session."""
+        """Process a hook event for this session.
+
+        When a subagent is active, nested tool events (tool_start/tool_end that
+        aren't the Agent tool itself) are forwarded to the sub-miku so it reacts
+        to what the subagent is actually doing.
+        """
         if self._destroyed:
             return
 
         etype = event.get("event_type", "")
         tool_name = event.get("tool_name", "")
+        tool_use_id = event.get("tool_use_id", "")
         self.restless.notify_event()
 
         if etype == "tool_end":
@@ -327,9 +339,19 @@ class MikuSlot:
             self.physics.unlock()
 
         if etype == "tool_start" and tool_name in ("Agent", "Task"):
+            self._active_subagent_ids.append(tool_use_id)
             self._spawn_sub_miku()
         elif etype == "subagent_stop":
             self._dismiss_sub_miku()
+            if self._active_subagent_ids:
+                self._active_subagent_ids.pop()
+        elif self._active_subagent_ids and self._sub_mikus:
+            # nested tool event while subagent is running — forward to sub-miku
+            # (but not the Agent's own tool_end)
+            if etype == "tool_end" and tool_use_id in self._active_subagent_ids:
+                pass  # this is the Agent tool itself ending, not a nested call
+            else:
+                self._sub_mikus[-1].handle_event(event)
 
         self.state_machine.handle_event(event)
 
@@ -395,7 +417,11 @@ class MikuSlot:
         self._play(state.action)
 
     def _spawn_sub_miku(self):
-        """Create an in-process sub-miku slot (instead of a subprocess)."""
+        """Create an in-process sub-miku for a subagent.
+
+        The parent forwards nested tool events to the sub-miku so it reacts
+        to what the subagent is doing (reading, writing, bashing, etc.).
+        """
         pos = self.player.pos()
         self._sub_counter += 1
         sub_id = f"{self.session_id}:sub{self._sub_counter}"
@@ -406,6 +432,7 @@ class MikuSlot:
             ax_threaded=self._ax_threaded,
             scale=0.5,
             solo=True,
+            is_sub=True,
             entry_action="spawned",
             init_x=pos.x() + offset,
             init_y=pos.y(),
@@ -416,6 +443,7 @@ class MikuSlot:
         self._sub_mikus.append(sub)
         # clean up any already-destroyed subs
         self._sub_mikus = [s for s in self._sub_mikus if not s._destroyed]
+        print(f"[claudemeji:{self.session_id}] sub-miku {sub_id} spawned (listening to nested events)")
 
     def _dismiss_sub_miku(self):
         """Tear down the most recently spawned sub-miku."""
