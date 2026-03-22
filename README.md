@@ -25,7 +25,7 @@ claude code hooks write per-session events to `~/.claudemeji/events/`. the **con
 | **climbs walls** | screen edges and window sides, with ceiling crawling |
 | **gets restless** | escalates from calm → fidgety → climby → grabby → feral |
 | **chases your cursor** | at restlessness 2+, she starts following you |
-| **pushes/peeks/throws windows** | at high restlessness, she interacts with your windows |
+| **pushes/throws windows** | at high restlessness, she interacts with your windows |
 | **carries windows** | jumps to a window corner and walks off with it |
 | **reacts to drag** | calm when grabbed at low restlessness, angry when feral |
 | **z-orders correctly** | goes behind windows above the one she's standing on |

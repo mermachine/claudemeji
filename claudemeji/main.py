@@ -426,7 +426,7 @@ def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
         return info.rect, info.pid, corner
 
     from claudemeji.physics import PhysicsState as _PS
-    _blocked_states = {_PS.DRAGGED, _PS.CARRYING_WINDOW, _PS.PUSHING_WINDOW, _PS.PEEKING}
+    _blocked_states = {_PS.DRAGGED, _PS.CARRYING_WINDOW, _PS.PUSHING_WINDOW}
 
     win_action_btns = []
 
@@ -434,7 +434,6 @@ def _show_debug_panel(player: SpritePlayer, physics: PhysicsEngine,
     for label, action_key in [
         ("Jump to", "jump_to"),
         ("Push", "push"),
-        ("Peek", "peek"),
     ]:
         btn = QPushButton(label)
         def make_handler(action=action_key):
