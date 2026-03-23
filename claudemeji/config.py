@@ -1,24 +1,29 @@
 """
-config.py - loads config.toml and resolves sprite pack + action mappings
+config.py - loads global config + per-pack config from ~/.claudemeji/
 
-Compound state config format:
+Directory layout:
+  ~/.claudemeji/
+    config.toml                 # global: active_pack, physics overrides
+    packs/
+      shimemiku/
+        config.toml             # pack-specific: sprite_pack path, actions, aliases
+      pokemon/
+        config.toml
 
-  [actions.react_good]
-  files = ["shime22.png", "shime18.png"]   # base (fallback)
-  fps = 10
-  loop = false
+Global config.toml:
+  active_pack = "shimemiku"
 
-  [actions.react_good.postures.sitting]    # override when sitting
-  files = ["shime28.png"]
-  fps = 8
-  loop = false
+  [physics]
+  window_pull_distance = 40
+  default_facing = "left"
 
-  [actions.drag]
-  files = ["shime48.png"]                  # base drag (calm)
+Pack config.toml (same action format as before):
+  [sprite_pack]
+  path = "/path/to/img"
 
-  [actions.drag.contexts.r2]               # drag at restlessness 2 (annoyed)
-  files = ["shime7.png", "shime8.png"]
-  fps = 6
+  [actions.stand]
+  files = ["shime1.png"]
+  ...
 """
 
 from __future__ import annotations
@@ -36,16 +41,24 @@ else:
 
 from claudemeji.sprite import ActionDef
 
-DEFAULT_CONFIG_PATH = os.path.expanduser("~/.claudemeji/config.toml")
+CONFIG_DIR = os.path.expanduser("~/.claudemeji")
+GLOBAL_CONFIG_PATH = os.path.join(CONFIG_DIR, "config.toml")
+PACKS_DIR = os.path.join(CONFIG_DIR, "packs")
 
 
 @dataclass
 class PackConfig:
-    path: str
+    name: str           # pack directory name (e.g. "shimemiku")
+    path: str           # resolved img directory path
 
     @property
     def img_dir_path(self) -> str:
         return os.path.expanduser(self.path)
+
+    @property
+    def config_path(self) -> str:
+        """Path to this pack's config.toml."""
+        return os.path.join(PACKS_DIR, self.name, "config.toml")
 
 
 @dataclass
@@ -102,23 +115,21 @@ def _parse_action_def(adef: dict) -> ActionDef:
     )
 
 
-def load(path: str = DEFAULT_CONFIG_PATH) -> Config:
+def _load_toml(path: str) -> dict:
+    """Load a TOML file and return the parsed dict."""
     if tomllib is None:
         raise ImportError(
             "Python 3.11+ required for built-in tomllib, or: pip install tomli"
         )
-
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"No config found at {path}. "
-            "Copy config.example.toml to ~/.claudemeji/config.toml to get started."
-        )
-
     with open(path, "rb") as f:
-        data = tomllib.load(f)
+        return tomllib.load(f)
 
+
+def _parse_pack_data(pack_name: str, data: dict) -> tuple[PackConfig, dict[str, ActionDef], dict[str, str]]:
+    """Parse pack-level config data (sprite_pack, actions, aliases)."""
     pack_data = data.get("sprite_pack", {})
     pack = PackConfig(
+        name=pack_name,
         path=os.path.expanduser(pack_data.get("path", ".")),
     )
 
@@ -130,11 +141,73 @@ def load(path: str = DEFAULT_CONFIG_PATH) -> Config:
         actions["sit_idle"] = ActionDef(files=["shime1.png"], fps=1, loop=True)
 
     aliases = data.get("action_aliases", {})
+    return pack, actions, aliases
 
+
+def _parse_physics(data: dict) -> PhysicsConfig:
+    """Parse physics config from global config data."""
     physics_data = data.get("physics", {})
-    physics = PhysicsConfig(
+    return PhysicsConfig(
         window_pull_distance=physics_data.get("window_pull_distance", 0),
         default_facing=physics_data.get("default_facing", "left"),
     )
+
+
+def available_packs() -> list[str]:
+    """List installed pack names (directories under ~/.claudemeji/packs/)."""
+    if not os.path.isdir(PACKS_DIR):
+        return []
+    return sorted(
+        d for d in os.listdir(PACKS_DIR)
+        if os.path.isfile(os.path.join(PACKS_DIR, d, "config.toml"))
+    )
+
+
+def load(path: str | None = None) -> Config:
+    """Load config from the global config + active pack.
+
+    If `path` is given (via CLAUDEMEJI_CONFIG env var), load that as a
+    standalone pack config (useful for development / the animator).
+    """
+    if tomllib is None:
+        raise ImportError(
+            "Python 3.11+ required for built-in tomllib, or: pip install tomli"
+        )
+
+    # direct path override — treat as a standalone pack config (dev/animator mode)
+    if path:
+        data = _load_toml(path)
+        pack, actions, aliases = _parse_pack_data("custom", data)
+        physics = _parse_physics(data)
+        return Config(pack=pack, actions=actions, aliases=aliases, physics=physics)
+
+    # --- normal load: global config → active pack ---
+
+    if not os.path.exists(GLOBAL_CONFIG_PATH):
+        raise FileNotFoundError(
+            f"No config found at {GLOBAL_CONFIG_PATH}. "
+            "Run the installer or create ~/.claudemeji/config.toml with: active_pack = \"shimemiku\""
+        )
+
+    global_data = _load_toml(GLOBAL_CONFIG_PATH)
+    active_pack = global_data.get("active_pack", "shimemiku")
+
+    pack_config_path = os.path.join(PACKS_DIR, active_pack, "config.toml")
+    if not os.path.exists(pack_config_path):
+        raise FileNotFoundError(
+            f"Pack '{active_pack}' not found at {pack_config_path}. "
+            f"Available packs: {', '.join(available_packs()) or '(none)'}"
+        )
+
+    pack_data = _load_toml(pack_config_path)
+    pack, actions, aliases = _parse_pack_data(active_pack, pack_data)
+
+    # physics: pack can define defaults, global config overrides
+    physics = _parse_physics(pack_data)
+    global_physics = global_data.get("physics", {})
+    if "window_pull_distance" in global_physics:
+        physics.window_pull_distance = global_physics["window_pull_distance"]
+    if "default_facing" in global_physics:
+        physics.default_facing = global_physics["default_facing"]
 
     return Config(pack=pack, actions=actions, aliases=aliases, physics=physics)

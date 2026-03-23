@@ -1746,7 +1746,7 @@ class AnimatorWindow(QMainWindow):
 
         out_path, _ = QFileDialog.getSaveFileName(
             self, "Save config.toml",
-            os.path.expanduser("~/.claudemeji/config.toml"),
+            os.path.expanduser("~/.claudemeji/packs/"),
             "TOML files (*.toml)"
         )
         if not out_path:

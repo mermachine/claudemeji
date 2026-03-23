@@ -639,7 +639,7 @@ def main():
 
     config_path = os.environ.get("CLAUDEMEJI_CONFIG", None)
     try:
-        config = load_config(config_path) if config_path else load_config()
+        config = load_config(config_path)
     except FileNotFoundError as e:
         print(f"[claudemeji] {e}")
         config = None

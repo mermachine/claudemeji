@@ -87,16 +87,36 @@ fi
 
 # --- config ---
 
-mkdir -p "$CONFIG_DIR/events" "$CONFIG_DIR/pids"
+mkdir -p "$CONFIG_DIR/events" "$CONFIG_DIR/pids" "$CONFIG_DIR/packs"
+
+# --- pack config ---
+
+PACK_DIR="$CONFIG_DIR/packs/shimemiku"
+if [[ ! -f "$PACK_DIR/config.toml" ]]; then
+    info "installing shimemiku pack config"
+    mkdir -p "$PACK_DIR"
+    # copy pack config, rewriting the sprite path to the install location
+    sed "s|path = .*|path = \"$INSTALL_DIR/assets/shimemiku/shimemiku/img\"|" \
+        "$INSTALL_DIR/assets/shimemiku/config.toml" > "$PACK_DIR/config.toml"
+else
+    info "shimemiku pack config already exists"
+fi
+
+# --- global config ---
 
 if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
-    info "creating config at $CONFIG_DIR/config.toml"
-    # copy the shimemiku config, rewriting the sprite path to the install location
-    sed "s|path = .*|path = \"$INSTALL_DIR/assets/shimemiku/shimemiku/img\"|" \
-        "$INSTALL_DIR/assets/shimemiku/config.toml" > "$CONFIG_DIR/config.toml"
-    info "shimemiku sprite pack configured"
+    info "creating global config at $CONFIG_DIR/config.toml"
+    cat > "$CONFIG_DIR/config.toml" <<TOML
+# claudemeji global config
+# switch packs by changing active_pack to any directory name under ~/.claudemeji/packs/
+active_pack = "shimemiku"
+
+[physics]
+window_pull_distance = 40
+# default_facing = "left"
+TOML
 else
-    info "config already exists at $CONFIG_DIR/config.toml"
+    info "global config already exists at $CONFIG_DIR/config.toml"
 fi
 
 # --- hooks ---
