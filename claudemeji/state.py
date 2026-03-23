@@ -21,6 +21,8 @@ ACTIONS = [
     "crawl",          # deliberate belly crawl movement
     "trip",           # stumble/pratfall during run (one-shot, attention-seeking)
     "fall",
+    "land",           # hard landing after a big fall (one-shot tumble)
+    "land_soft",      # gentle landing after a medium fall (one-shot stumble)
     "jump",           # impulse-based jump toward a target
     "climb",          # wall climbing (flipped for right wall)
     "ceiling",        # ceiling crawl (flipped for direction)
@@ -43,8 +45,7 @@ ACTIONS = [
     "window_push",       # pushing/dragging a window
     "window_throw",      # throwing a window (arc + minimize)
     "window_carry",      # walking with a grabbed window
-    "window_carry_perch",# perched on window corner before grabbing
-    "window_carry_cheer",# celebration after throwing a carried window
+    "window_carry_run",  # running with a grabbed window
 ]
 
 # Map claude code tool names → our action names

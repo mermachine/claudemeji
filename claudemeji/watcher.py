@@ -1,11 +1,14 @@
 """
 watcher.py - watches the state file written by claude code hooks
 
-Emits events from the hook log, plus two synthetic events:
+Emits events from the hook log, plus synthetic events:
   - idle_triggered: no events for IDLE_TIMEOUT seconds
   - wait_triggered: tool_start seen but no tool_end within WAIT_TIMEOUT seconds
-                    (i.e. waiting for user permission or a very slow tool)
+                    (i.e. a very slow tool — permission prompts are caught earlier)
   - wait_cleared:   tool_end arrived, cancels the wait state
+  - permission_requested: Notification hook fired with notification_type=permission_prompt
+  - tool_denied:    a pending tool got a bare notification (no permission_prompt) without
+                    ever receiving a tool_end — the user denied the permission
 """
 
 from __future__ import annotations
@@ -37,10 +40,12 @@ def _find_latest_session_file() -> str:
 
 
 class HookWatcher(QObject):
-    event_received = pyqtSignal(dict)
-    idle_triggered = pyqtSignal()
-    wait_triggered = pyqtSignal()   # tool taking too long / permission request
-    wait_cleared   = pyqtSignal()   # tool finished, cancel wait state
+    event_received       = pyqtSignal(dict)
+    idle_triggered       = pyqtSignal()
+    wait_triggered       = pyqtSignal()   # tool taking too long (fallback, 3s)
+    wait_cleared         = pyqtSignal()   # tool finished, cancel wait state
+    permission_requested = pyqtSignal()   # claude needs user permission (instant)
+    tool_denied          = pyqtSignal()   # user denied a pending tool
 
     def __init__(self, session_id: str | None = None, parent=None):
         super().__init__(parent)
@@ -66,6 +71,8 @@ class HookWatcher(QObject):
         idle_emitted    = False
         pending_tool_start = None   # monotonic time of last tool_start without matching tool_end
         wait_emitted    = False
+        # track tool_use_ids awaiting permission (permission_prompt seen, no tool_end yet)
+        permission_pending_ids: set[str] = set()
 
         with open(self._state_file, "r") as f:
             f.seek(0, 2)   # tail from end
@@ -82,17 +89,44 @@ class HookWatcher(QObject):
                         continue
 
                     etype = event.get("event_type", "")
+                    tool_use_id = event.get("tool_use_id", "")
+                    handled = False  # set True if a specialized signal consumed this event
 
                     if etype == "tool_start":
                         pending_tool_start = time.monotonic()
                         wait_emitted = False
+
                     elif etype == "tool_end":
                         if wait_emitted:
                             self.wait_cleared.emit()
                             wait_emitted = False
                         pending_tool_start = None
+                        permission_pending_ids.discard(tool_use_id)
 
-                    self.event_received.emit(event)
+                    elif etype == "notification":
+                        raw = event.get("raw", {})
+                        notif_type = raw.get("notification_type", "") if raw else ""
+
+                        if notif_type == "permission_prompt":
+                            # claude is asking for permission — fire wait immediately
+                            self.permission_requested.emit()
+                            permission_pending_ids.add(tool_use_id if tool_use_id else "_last")
+                            wait_emitted = True  # suppress the 3s fallback
+                            handled = True
+                        elif permission_pending_ids:
+                            # bare notification while tools are awaiting permission
+                            # = user denied a tool
+                            self.tool_denied.emit()
+                            permission_pending_ids.clear()
+                            wait_emitted = False
+                            handled = True
+                        else:
+                            handled = False
+
+                    # don't emit event_received for notifications already handled
+                    # by specialized signals (otherwise state machine stomps with "think")
+                    if etype != "notification" or not handled:
+                        self.event_received.emit(event)
                     last_event_time = time.monotonic()
                     idle_emitted = False
 
@@ -100,6 +134,7 @@ class HookWatcher(QObject):
                     now = time.monotonic()
 
                     # wait detection: tool_start with no tool_end for WAIT_TIMEOUT
+                    # (fallback for tools that don't trigger a permission prompt)
                     if (pending_tool_start is not None
                             and not wait_emitted
                             and (now - pending_tool_start) >= WAIT_TIMEOUT):

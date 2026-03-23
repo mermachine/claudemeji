@@ -58,7 +58,7 @@ _EVENT_ANIMS = {
     CreatureEvent.LANDED_TINY:   "stand",      # no animation, just resume
     CreatureEvent.TRIPPED:       "trip",
     CreatureEvent.THREW_WINDOW:  "window_throw",
-    CreatureEvent.CARRY_CHEERED: "window_carry_cheer",
+    CreatureEvent.CARRY_CHEERED: "react_good",
 }
 
 _SPEED_ANIMS = {
@@ -72,7 +72,7 @@ _SPEED_ANIMS = {
 _CARRY_PHASE_ANIMS = {
     CarryPhase.JUMP:         "jump",
     CarryPhase.GRAB_FALL:    "fall",
-    CarryPhase.PERCH:        "window_carry_perch",
+    CarryPhase.PERCH:        "window_carry",  # perch uses carry animation (carry_perch removed)
     CarryPhase.CARRY:        "window_carry",
     CarryPhase.THROW_WINDUP: "window_throw",
 }

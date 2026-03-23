@@ -773,6 +773,8 @@ def main():
         watcher.idle_triggered.connect(slot.handle_idle)
         watcher.wait_triggered.connect(slot.handle_wait_triggered)
         watcher.wait_cleared.connect(slot.handle_wait_cleared)
+        watcher.permission_requested.connect(slot.handle_permission_requested)
+        watcher.tool_denied.connect(slot.handle_tool_denied)
         watcher.start()
 
     sys.exit(app.exec())

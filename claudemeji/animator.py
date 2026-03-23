@@ -69,6 +69,8 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "trip":          "Stumble/pratfall during run (one-shot)",
     "jump":          "Impulse jump toward a target",
     "fall":          "Falling / thrown",
+    "land":          "Hard landing after a big fall (one-shot tumble)",
+    "land_soft":     "Gentle landing after a medium fall (one-shot stumble)",
     "climb":         "Wall climbing (flipped for right wall)",
     "ceiling":       "Ceiling crawl (flipped for direction)",
     "hang":          "Hanging/dangling on a wall (stationary)",
@@ -88,10 +90,7 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "window_push":        "Pushing/dragging a window (restlessness >= 2)",
     "window_throw":       "Throwing a window — arc + minimize (restlessness >= 4)",
     "window_carry":       "Walking with a grabbed window",
-    "window_carry_perch": "Perched on window corner before grabbing",
     "window_carry_run":   "Running with a grabbed window",
-    "window_carry_throw": "Winding up to throw a carried window",
-    "window_carry_cheer": "Celebration after throwing a carried window",
 }
 
 ACTION_POSTURES: dict[str, list[str]] = {
@@ -793,6 +792,7 @@ class AnimatorWindow(QMainWindow):
 
         self._img_dir = ""
         self._pack_path = ""
+        self._pack_config_path = ""  # path to the pack config.toml we loaded from
         self._current_action = ACTIONS[0]
         self._current_variant = "base"
         self._current_phase = "loop"  # "intro" | "loop" | "outro"
@@ -1322,6 +1322,31 @@ class AnimatorWindow(QMainWindow):
             QMessageBox.critical(self, "Load failed", f"Could not parse config:\n{e}")
             return
 
+        # if this is the global config (has active_pack, no sprite_pack),
+        # follow the pointer to the pack config and merge physics overrides
+        global_physics = {}
+        if "active_pack" in data and "sprite_pack" not in data:
+            global_physics = data.get("physics", {})
+            pack_name = data["active_pack"]
+            resolved_config_path = os.path.join(
+                os.path.expanduser("~/.claudemeji/packs"), pack_name, "config.toml"
+            )
+            if not os.path.exists(resolved_config_path):
+                QMessageBox.critical(
+                    self, "Pack not found",
+                    f"Active pack '{pack_name}' not found at:\n{resolved_config_path}"
+                )
+                return
+            try:
+                with open(resolved_config_path, "rb") as f:
+                    data = tomllib.load(f)
+            except Exception as e:
+                QMessageBox.critical(self, "Load failed", f"Could not parse pack config:\n{e}")
+                return
+            self._pack_config_path = resolved_config_path
+        else:
+            self._pack_config_path = path
+
         pack_data = data.get("sprite_pack", {})
         pack_path = os.path.expanduser(pack_data.get("path", ""))
         img_subdir = pack_data.get("img_dir", "")
@@ -1350,9 +1375,12 @@ class AnimatorWindow(QMainWindow):
         for name, adef_raw in data.get("actions", {}).items():
             self._action_defs[name] = _parse_action_def(adef_raw)
 
+        # physics: pack defaults, global overrides
         physics_data = data.get("physics", {})
-        self._window_pull_spin.setValue(physics_data.get("window_pull_distance", 0))
-        self._facing_combo.setCurrentText(physics_data.get("default_facing", "left"))
+        pull = global_physics.get("window_pull_distance", physics_data.get("window_pull_distance", 0))
+        facing = global_physics.get("default_facing", physics_data.get("default_facing", "left"))
+        self._window_pull_spin.setValue(pull)
+        self._facing_combo.setCurrentText(facing)
 
         # rebuild action list to include custom actions from config
         self._rebuild_action_list()
@@ -1744,9 +1772,10 @@ class AnimatorWindow(QMainWindow):
             QMessageBox.warning(self, "No pack", "Open a sprite pack folder first.")
             return
 
+        default_save = self._pack_config_path or os.path.expanduser("~/.claudemeji/packs/")
         out_path, _ = QFileDialog.getSaveFileName(
             self, "Save config.toml",
-            os.path.expanduser("~/.claudemeji/packs/"),
+            default_save,
             "TOML files (*.toml)"
         )
         if not out_path:

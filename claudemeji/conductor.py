@@ -69,6 +69,10 @@ class MikuManager(QObject):
             slot.handle_wait_triggered()
         elif etype == "_wait_cleared":
             slot.handle_wait_cleared()
+        elif etype == "_permission_requested":
+            slot.handle_permission_requested()
+        elif etype == "_tool_denied":
+            slot.handle_tool_denied()
         else:
             slot.handle_event(event)
 

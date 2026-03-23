@@ -107,6 +107,12 @@ class MultiHookWatcher(QObject):
         watcher.wait_cleared.connect(
             lambda sid=session_id: self.event_received.emit(sid, {"event_type": "_wait_cleared"})
         )
+        watcher.permission_requested.connect(
+            lambda sid=session_id: self.event_received.emit(sid, {"event_type": "_permission_requested"})
+        )
+        watcher.tool_denied.connect(
+            lambda sid=session_id: self.event_received.emit(sid, {"event_type": "_tool_denied"})
+        )
 
         self._watchers[session_id] = watcher
         watcher.start()

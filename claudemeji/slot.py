@@ -369,6 +369,23 @@ class MikuSlot:
         self.state_machine.handle_event({"event_type": "tool_start", "tool_name": "_wait"})
         self._event_unlock_timer.start(TOOL_SAFETY_LOCK_MS)
 
+    def handle_permission_requested(self):
+        """Notification: claude needs user permission — show wait immediately.
+        Unlike the 3s fallback (handle_wait_triggered), this fires even during bash,
+        because a permission prompt means claude is blocked waiting for the user."""
+        if self._destroyed:
+            return
+        self.state_machine.handle_event({"event_type": "tool_start", "tool_name": "_wait"})
+        self._event_unlock_timer.start(TOOL_SAFETY_LOCK_MS)
+
+    def handle_tool_denied(self):
+        """User denied a pending tool — react_bad."""
+        if self._destroyed:
+            return
+        self.state_machine.handle_event({"event_type": "tool_denied"})
+        self.physics.unlock()
+        self._event_unlock_timer.start(REACTION_LOCK_MS)
+
     def handle_wait_cleared(self):
         """Synthetic event: tool_end arrived after wait state."""
         if self._destroyed:
